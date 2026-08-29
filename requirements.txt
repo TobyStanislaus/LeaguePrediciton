@@ -1,0 +1,16 @@
+# --- API access ---
+requests>=2.32
+python-dotenv>=1.0
+
+# --- data handling / cache ---
+pandas>=2.2
+pyarrow>=16.0          # Parquet cache backend (sqlite3 is stdlib)
+
+# --- modelling ---
+scikit-learn>=1.5
+xgboost>=2.1
+lightgbm>=4.5
+matplotlib>=3.9        # calibration curves
+
+# --- dev ---
+pytest>=8.0

@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------------
+# Secrets -- NEVER commit these.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Raw API responses / local caches.
+# Cached match data bloats the repo and is trivially re-fetchable from Riot.
+# ---------------------------------------------------------------------------
+data/cache/
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+
+# Derived artefacts (feature tables, trained models, plots)
+data/processed/
+artifacts/
+*.pkl
+*.joblib
+*.png
+!docs/**/*.png
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / typing / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
