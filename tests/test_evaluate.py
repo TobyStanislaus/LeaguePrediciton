@@ -241,6 +241,18 @@ def test_load_features_rejects_a_table_missing_columns(tmp_path, suffix):
         load_features(path)
 
 
+def test_load_features_falls_back_to_csv_when_parquet_is_absent(tmp_path):
+    """build_features writes CSV where Parquet is blocked; asking for the
+    .parquet path should still find it rather than failing."""
+    save_table(make_table(12), tmp_path / "features.csv")
+    assert len(load_features(tmp_path / "features.parquet")) == 12
+
+
+def test_missing_feature_table_says_how_to_build_one(tmp_path):
+    with pytest.raises(FileNotFoundError, match="build_features"):
+        load_features(tmp_path / "missing.parquet")
+
+
 @pytest.mark.parametrize("suffix", FORMATS)
 def test_load_features_round_trips(tmp_path, suffix):
     path = tmp_path / f"good.{suffix}"

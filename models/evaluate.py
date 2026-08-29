@@ -311,6 +311,20 @@ def load_features(path: str | Path) -> pd.DataFrame:
     some Windows Application Control policies block.
     """
     path = Path(path)
+    if not path.exists() and path.suffix != ".csv":
+        alternative = path.with_suffix(".csv")
+        if alternative.exists():
+            log.info("%s not found -- reading %s instead", path, alternative)
+            path = alternative
+
+    if not path.exists():
+        # Without this, a missing file surfaces as an ImportError from the
+        # Parquet engine, which says nothing about what actually went wrong.
+        raise FileNotFoundError(
+            f"no feature table at {path}. Build one first:\n"
+            "    python -m features.build_features --mode reconstructed"
+        )
+
     table = pd.read_csv(path) if path.suffix == ".csv" else pd.read_parquet(path)
     missing = set(feature_columns() + [LABEL_COLUMN]) - set(table.columns)
     if missing:
