@@ -135,6 +135,23 @@ Useful flags:
 Progress, API call counts, cache hits, retries and 429s are logged as it runs;
 Ctrl-C is safe.
 
+### Cost depends enormously on which tier you seed
+
+Phase 3 only has to look up players the stored snapshots do not already cover,
+and the apex ladders are small enough to store whole. Measured on real runs of
+comparable size:
+
+| Seed | Ladder entries stored | Phase-3 lookups needed |
+| --- | --- | --- |
+| Challenger + GM + Master | 11,002 (3 calls) | **9** |
+| Emerald + Diamond (2 pages/division) | 3,280 (16 calls) | **1,279** |
+
+The Master ladder alone returns 10,000 entries in a single call, so apex
+collection is nearly free after the seed. Emerald and Diamond hold hundreds of
+thousands of players, so a couple of ladder pages cover almost none of the
+opponents your seed players actually meet, and nearly every participant costs
+its own call. Budget accordingly, or raise `--pages`.
+
 ### Timing, and why it matters for leakage
 
 LEAGUE-V4 returns a player's rank **right now**, not their rank when some past
@@ -232,10 +249,15 @@ Both are scored identically, so the comparison is fair:
 python -m data.collect --platform euw1 --tiers CHALLENGER GRANDMASTER MASTER --max-summoners 40 --matches-per-summoner 15 --forward-only
 ```
 
-Each run records a fresh ladder snapshot and collects matches played since the
-previous one. Those rows have a snapshot that genuinely predates kickoff, so
-`--mode point_in_time` starts producing data after the second run. Until then it
-correctly returns nothing.
+Each run records a fresh ladder snapshot and collects matches whose kickoff
+falls between the **previous** snapshot and now. Those rows have a snapshot that
+genuinely predates them, so `--mode point_in_time` starts producing data from
+the second run onwards. The first run has no earlier snapshot to open a window
+against, so it records its snapshot, says so, and collects nothing.
+
+The window must open at the previous snapshot, not the one the run just wrote —
+anchoring on the new one asks Riot for matches started after "now" and returns
+nothing on every run. `tests/test_collect.py` pins this.
 
 ---
 
@@ -254,13 +276,28 @@ test on a chronological split.
 Always-predict-blue scores 0.516, and a constant 0.5 prediction scores 0.693 on
 log loss — both models beat both bars.
 
-**The measured cost of leakage: +2.4 points of accuracy and +0.077 ROC AUC.**
+### The cost of leakage, with error bars
+
+`scripts/leakage_report.py` builds the same matches both ways and compares them
+on an identical split, bootstrapping the gap over resampled test matches:
+
+| Model | Accuracy gap | 95% CI | AUC gap | 95% CI |
+| --- | --- | --- | --- | --- |
+| logistic | +0.024 | [−0.016, +0.065] | +0.078 | [+0.052, +0.106] |
+| boosted | +0.024 | [−0.032, +0.081] | +0.053 | [+0.007, +0.100] |
+
+**The AUC gap is real; the accuracy gap is not resolvable at 124 test matches.**
+Both accuracy intervals span zero. AUC uses the whole ranking rather than
+thresholded decisions, so it picks up a leak that accuracy cannot distinguish
+from noise at this sample size. Quote the AUC gap, not the accuracy gap, until
+the dataset is substantially larger.
 
 The instructive part is that the leaky number is *not* absurd. Naive joining
 gives 60.5%, comfortably inside the 55–65% band that looks reasonable for this
 problem. Nothing about it screams "bug". Leakage here does not announce itself
-as 95% accuracy; it quietly adds a couple of points and leaves a result you
-would happily publish. Comparing modes is what makes it visible.
+as 95% accuracy; it quietly shifts the ranking and leaves a result you would
+happily publish. Comparing modes is what makes it visible — and the unit tests,
+not the metrics, are what prove the mechanism exists.
 
 Two caveats on these numbers:
 

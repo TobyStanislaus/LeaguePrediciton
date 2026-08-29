@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from data.cache import Cache
-from data.collect import collect_matches, seed_ladder
+from data.collect import collect_matches, forward_only_start_time, seed_ladder
 from data.riot_client import RiotNotFoundError
 
 
@@ -92,6 +92,27 @@ def test_seed_without_a_cap_uses_every_player(cache: Cache):
     assert len(puuids) == 7
 
 
+def test_seed_sampling_spreads_across_the_ladder(cache: Cache):
+    """Slicing the first N would draw every seed from one tier/division page."""
+    client = StubClient(ladder_size=200)
+    _, puuids = seed_ladder(client, cache, tiers=["CHALLENGER"], max_summoners=20)
+
+    positions = sorted(int(p.split("-")[1]) for p in puuids)
+    assert len(positions) == 20
+    assert max(positions) > 100, "sample is confined to the head of the ladder"
+
+
+def test_seed_sampling_is_reproducible(cache: Cache, tmp_path):
+    client = StubClient(ladder_size=200)
+    _, first = seed_ladder(client, cache, tiers=["CHALLENGER"], max_summoners=15, random_state=7)
+    with Cache(tmp_path / "second.sqlite") as other:
+        _, second = seed_ladder(
+            StubClient(ladder_size=200), other, tiers=["CHALLENGER"],
+            max_summoners=15, random_state=7,
+        )
+    assert first == second
+
+
 def test_seed_only_resolves_puuids_for_the_seed_subset(cache: Cache):
     """Resolving the whole ladder could cost hundreds of extra API calls."""
     client = StubClient(ladder_size=100, with_puuid=False)
@@ -149,6 +170,46 @@ def test_forward_only_passes_start_time_through(cache: Cache):
     client = StubClient()
     collect_matches(client, cache, ["puuid-0"], start_time=1_726_000_000)
     assert client.match_id_calls[0][1] == 1_726_000_000
+
+
+def _snapshot_at(cache: Cache, captured_at: float) -> int:
+    snapshot_id = cache.start_league_snapshot("euw1", "RANKED_SOLO_5x5")
+    cache.conn.execute(
+        "UPDATE league_snapshots SET captured_at = ? WHERE snapshot_id = ?",
+        (captured_at, snapshot_id),
+    )
+    cache.conn.commit()
+    return snapshot_id
+
+
+def test_forward_only_window_opens_at_the_previous_snapshot(cache: Cache):
+    """Regression: anchoring on the new snapshot asks for matches after 'now'.
+
+    That returned zero matches on every run, forever, rather than the matches
+    played since the last run.
+    """
+    _snapshot_at(cache, 1_000.0)
+    latest = _snapshot_at(cache, 5_000.0)
+    assert forward_only_start_time(cache, latest) == 1_000.0
+
+
+def test_forward_only_uses_the_most_recent_earlier_snapshot(cache: Cache):
+    _snapshot_at(cache, 1_000.0)
+    _snapshot_at(cache, 3_000.0)
+    latest = _snapshot_at(cache, 5_000.0)
+    assert forward_only_start_time(cache, latest) == 3_000.0
+
+
+def test_forward_only_has_no_window_on_the_very_first_run(cache: Cache):
+    first = _snapshot_at(cache, 1_000.0)
+    assert forward_only_start_time(cache, first) is None
+
+
+def test_forward_only_ignores_snapshots_taken_later(cache: Cache):
+    """A snapshot written after this one is not a valid window opener."""
+    target = _snapshot_at(cache, 2_000.0)
+    _snapshot_at(cache, 9_000.0)
+    assert forward_only_start_time(cache, target) is None
 
 
 def test_missing_match_list_is_skipped_not_fatal(cache: Cache):

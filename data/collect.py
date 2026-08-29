@@ -1,4 +1,4 @@
-"""Collection driver: ladder seed -> match IDs -> match detail -> per-player league stats.
+﻿"""Collection driver: ladder seed -> match IDs -> match detail -> per-player league stats.
 
 Run::
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import sys
 import time
 from typing import Any, Iterable, Sequence
@@ -79,6 +80,7 @@ def seed_ladder(
     divisions: Sequence[str] = NON_APEX_DIVISIONS,
     pages: int = 1,
     max_summoners: int | None = None,
+    random_state: int = 0,
 ) -> tuple[int, list[str]]:
     """Record a ladder snapshot. Returns (snapshot_id, puuids)."""
     snapshot_id = cache.start_league_snapshot(
@@ -113,7 +115,12 @@ def seed_ladder(
 
     # Only the seed subset drives match collection, so only it needs a PUUID
     # resolved -- resolving all of them could cost hundreds of extra calls.
-    seeds = entries if max_summoners is None else entries[:max_summoners]
+    # Sampled rather than sliced: entries arrive ordered by tier, division and
+    # page, so taking the first N would draw every seed from one division.
+    if max_summoners is None or max_summoners >= len(entries):
+        seeds = list(entries)
+    else:
+        seeds = random.Random(random_state).sample(entries, max_summoners)
     seeds = resolve_missing_puuids(client, seeds)
     puuids = [e["puuid"] for e in seeds if e.get("puuid")]
 
@@ -284,6 +291,26 @@ def collect_participant_league_entries(
     return written
 
 
+def forward_only_start_time(cache: Cache, snapshot_id: int) -> float | None:
+    """Kickoff cutoff for a forward-only run: the *previous* snapshot's capture.
+
+    The window has to open at the previous snapshot, not the one this run just
+    wrote. Matches played since then have a snapshot that genuinely predates
+    them, which is the whole point; anchoring on the new snapshot would ask for
+    matches started after "now" and return nothing, every time.
+
+    Returns ``None`` when no earlier snapshot exists -- there is no clean window
+    yet, so this run should record its snapshot and collect no matches.
+    """
+    row = cache.conn.execute(
+        "SELECT captured_at FROM league_snapshots WHERE snapshot_id <> ?"
+        " AND captured_at <= (SELECT captured_at FROM league_snapshots WHERE snapshot_id = ?)"
+        " ORDER BY captured_at DESC LIMIT 1",
+        (snapshot_id, snapshot_id),
+    ).fetchone()
+    return None if row is None else float(row["captured_at"])
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -326,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-participants", action="store_true", help="skip phase 3"
     )
+    parser.add_argument(
+        "--random-state", type=int, default=0,
+        help="seed for sampling which ladder players drive match collection",
+    )
     parser.add_argument("--db", default=str(DEFAULT_CACHE_PATH), help="SQLite cache path")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -354,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             divisions=args.divisions,
             pages=args.pages,
             max_summoners=args.max_summoners,
+            random_state=args.random_state,
         )
         if not puuids:
             log.error("seed produced no PUUIDs -- nothing to collect")
@@ -361,13 +393,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         start_time = None
         if args.forward_only:
-            row = cache.conn.execute(
-                "SELECT captured_at FROM league_snapshots WHERE snapshot_id = ?", (snapshot_id,)
-            ).fetchone()
-            start_time = int(row["captured_at"])
+            previous = forward_only_start_time(cache, snapshot_id)
+            if previous is None:
+                log.warning(
+                    "forward-only: no earlier snapshot exists, so no match yet has a snapshot "
+                    "predating it. Snapshot recorded; re-run later to collect matches played "
+                    "since. Nothing to collect on this run."
+                )
+                return 0
+            start_time = int(previous)
             log.info(
-                "forward-only: requesting matches started after %s",
+                "forward-only: collecting matches started after the previous snapshot (%s, %.1f "
+                "hours ago)",
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
+                (time.time() - start_time) / 3600.0,
             )
         else:
             log.warning(
