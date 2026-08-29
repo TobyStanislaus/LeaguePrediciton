@@ -107,14 +107,22 @@ def seed_ladder(
                     )
                     entries.extend(normalised)
 
-    resolved = resolve_missing_puuids(client, entries)
-    if max_summoners is not None:
-        resolved = resolved[:max_summoners]
+    # Store the whole ladder, not just the seed subset: it all arrived in the
+    # same call, and every entry recorded here is one less phase-3 lookup later.
+    written = cache.add_league_entries(snapshot_id, entries)
 
-    written = cache.add_league_entries(snapshot_id, resolved)
-    puuids = [e["puuid"] for e in resolved if e.get("puuid")]
-    log.info("snapshot %d: wrote %d league entries (%d usable PUUIDs)",
-             snapshot_id, written, len(puuids))
+    # Only the seed subset drives match collection, so only it needs a PUUID
+    # resolved -- resolving all of them could cost hundreds of extra calls.
+    seeds = entries if max_summoners is None else entries[:max_summoners]
+    seeds = resolve_missing_puuids(client, seeds)
+    puuids = [e["puuid"] for e in seeds if e.get("puuid")]
+
+    log.info(
+        "snapshot %d: wrote %d league entries; seeding matches from %d players",
+        snapshot_id,
+        written,
+        len(puuids),
+    )
     return snapshot_id, puuids
 
 
