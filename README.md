@@ -211,6 +211,28 @@ the interval that was never collected stays baked into the counters, but its
 result is uncorrelated with the match being predicted, so it is noise rather
 than leakage.
 
+### Reconstruction expires — `--max-snapshot-age-days`
+
+Undoing a result assumes the snapshot still *contains* it. Days later that
+holds. Months later it does not: LP is bounded within a division and resets
+between splits, and the player has since played hundreds of games. Subtracting
+`lp_delta × outcome` from a number that no longer contains this match's result
+does not remove the outcome — **it stamps it in, inverted**, and a model reads
+it straight back off.
+
+This was not hypothetical. A mixed-tier dataset with a median snapshot age of 33
+days scored **0.83 accuracy** on supposedly de-leaked features, with the winning
+team's LP systematically *lower* — the inverted signature that gave it away.
+
+Pairs older than `--max-snapshot-age-days` (default 7) are therefore dropped
+rather than reconstructed. Rows the pipeline cannot honestly reconstruct are
+worth less than no rows at all.
+
+The cost is real: of 493 collected apex matches, 342 survive; of 150 mixed-tier
+matches, only 29 do. Lower-tier players queue less often, so their ten most
+recent matches stretch back months. Seeding low tiers needs many more seed
+players, each contributing only their last few days of games.
+
 Parquet is used when available and CSV otherwise; pyarrow's Parquet extension is
 a compiled DLL that Windows Application Control policies sometimes block.
 
@@ -263,41 +285,47 @@ nothing on every run. `tests/test_collect.py` pins this.
 
 ## Results so far
 
-493 matches from the EUW apex ladders (Master/GM/Challenger), 369 train / 124
-test on a chronological split.
+342 matches from the EUW apex ladders (Master/GM/Challenger) that survive the
+staleness guard, 256 train / 86 test on a chronological split.
 
 | Mode | Model | Accuracy | Log loss | Brier | ROC AUC |
 | --- | --- | --- | --- | --- | --- |
-| naive (leaky) | logistic | 0.605 | 0.633 | 0.220 | 0.705 |
-| naive (leaky) | boosted | 0.621 | 0.647 | 0.228 | 0.697 |
-| **reconstructed** | **logistic** | **0.581** | **0.677** | **0.242** | **0.627** |
-| reconstructed | boosted | 0.597 | 0.685 | 0.245 | 0.644 |
+| **reconstructed** | **logistic** | **0.593** | **0.644** | **0.227** | **0.726** |
+| reconstructed | boosted | 0.570 | 0.728 ⚠️ | 0.261 | 0.648 |
 
-Always-predict-blue scores 0.516, and a constant 0.5 prediction scores 0.693 on
-log loss — both models beat both bars.
+Always-predict-blue scores 0.547; a constant 0.5 prediction scores 0.693 on log
+loss. The logistic model beats both bars. The boosted model does not — its log
+loss is worse than a constant prediction, which the sanity check flags
+automatically. On a few hundred matches with a weak signal, the linear model is
+the better tool, and that ordering is itself informative.
+
+At 86 test matches every figure here is noisy, which the evaluator also says out
+loud.
 
 ### The cost of leakage, with error bars
 
 `scripts/leakage_report.py` builds the same matches both ways and compares them
 on an identical split, bootstrapping the gap over resampled test matches:
 
-| Model | Accuracy gap | 95% CI | AUC gap | 95% CI |
-| --- | --- | --- | --- | --- |
-| logistic | +0.024 | [−0.016, +0.065] | +0.078 | [+0.052, +0.106] |
-| boosted | +0.024 | [−0.032, +0.081] | +0.053 | [+0.007, +0.100] |
+| Model | naive | reconstructed | Accuracy gap | 95% CI | AUC gap | 95% CI |
+| --- | --- | --- | --- | --- | --- | --- |
+| logistic | 0.686 | 0.593 | **+0.093** | [+0.035, +0.163] | +0.067 | [+0.029, +0.108] |
+| boosted | 0.663 | 0.581 | +0.081 | [+0.000, +0.163] | +0.088 | [+0.035, +0.144] |
 
-**The AUC gap is real; the accuracy gap is not resolvable at 124 test matches.**
-Both accuracy intervals span zero. AUC uses the whole ranking rather than
-thresholded decisions, so it picks up a leak that accuracy cannot distinguish
-from noise at this sample size. Quote the AUC gap, not the accuracy gap, until
-the dataset is substantially larger.
+**Joining a current snapshot onto past matches buys about nine points of
+accuracy that the model has not earned**, and the interval clears zero.
 
 The instructive part is that the leaky number is *not* absurd. Naive joining
-gives 60.5%, comfortably inside the 55–65% band that looks reasonable for this
-problem. Nothing about it screams "bug". Leakage here does not announce itself
-as 95% accuracy; it quietly shifts the ranking and leaves a result you would
-happily publish. Comparing modes is what makes it visible — and the unit tests,
-not the metrics, are what prove the mechanism exists.
+gives 68.6% — high, but the kind of number you might talk yourself into. Leakage
+here does not announce itself as 95% accuracy; it quietly shifts the ranking and
+leaves a result you would happily publish. Comparing modes is what makes it
+visible, and the unit tests, not the metrics, are what prove the mechanism.
+
+Both failures found so far behaved this way. Neither produced an implausible
+score: the naive join gave 68.6%, and the stale-snapshot bug gave 0.83 in a
+dataset where 0.83 was merely surprising rather than obviously impossible. The
+thing that caught both was checking the *direction* of the top features, not the
+headline metric.
 
 Two caveats on these numbers:
 

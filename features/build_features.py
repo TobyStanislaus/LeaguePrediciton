@@ -75,6 +75,20 @@ MASTER_BASE = TIER_ORDINAL["MASTER"] * TIER_SPAN
 # Average LP swing per ranked game, used to undo LP in ``reconstructed`` mode.
 DEFAULT_LP_DELTA = 18.0
 
+# Reconstruction is only valid while the snapshot still reflects the match.
+#
+# Undoing a result assumes the snapshot's counters contain it. Days later that
+# holds. Months later it does not: LP is bounded per division and resets between
+# splits, and the player has since played hundreds of games. Subtracting
+# ``lp_delta * outcome`` from a number that no longer contains this match's
+# result does not remove the outcome -- it stamps it in, inverted, and a model
+# reads it straight back off. Observed for real: a mixed-tier set with a median
+# snapshot age of 33 days scored 0.83 accuracy purely on that artefact.
+#
+# Beyond this age a (match, player) pair is simply not reconstructable, so it is
+# dropped rather than silently fabricated.
+DEFAULT_MAX_SNAPSHOT_AGE_DAYS = 7.0
+
 # Per-team aggregates. The team-level feature names are built from these.
 TEAM_STATS = (
     "rank_points_mean",
@@ -239,7 +253,10 @@ def _reconstruct_counters(
 
 
 def build_player_state(
-    frames: RawFrames, mode: Mode, lp_delta: float = DEFAULT_LP_DELTA
+    frames: RawFrames,
+    mode: Mode,
+    lp_delta: float = DEFAULT_LP_DELTA,
+    max_snapshot_age_days: float | None = DEFAULT_MAX_SNAPSHOT_AGE_DAYS,
 ) -> pd.DataFrame:
     """One row per (match, player) carrying that player's pre-game state."""
     if mode not in MODES:
@@ -255,6 +272,23 @@ def build_player_state(
         return state
 
     if mode == "reconstructed":
+        if max_snapshot_age_days is not None:
+            age_days = (state["captured_at"] - state["game_start_ts"]) / 86400.0
+            keep = age_days <= max_snapshot_age_days
+            dropped = int((~keep).sum())
+            if dropped:
+                log.warning(
+                    "dropping %d of %d (match, player) rows whose snapshot is more than "
+                    "%.1f days after kickoff -- those results can no longer be undone "
+                    "reliably, and adjusting them injects the outcome instead of removing it",
+                    dropped,
+                    len(state),
+                    max_snapshot_age_days,
+                )
+            state = state[keep]
+            if state.empty:
+                return state
+
         state = _reconstruct_counters(
             state, pairs[["puuid", "game_start_ts", "player_won"]], lp_delta
         )
@@ -303,10 +337,13 @@ def build_feature_table(
     mode: Mode = "reconstructed",
     lp_delta: float = DEFAULT_LP_DELTA,
     require_full_teams: bool = True,
+    max_snapshot_age_days: float | None = DEFAULT_MAX_SNAPSHOT_AGE_DAYS,
 ) -> pd.DataFrame:
     """Build the model-ready table: one row per match, blue/red/diff features."""
     frames = load_frames(cache)
-    state = build_player_state(frames, mode=mode, lp_delta=lp_delta)
+    state = build_player_state(
+        frames, mode=mode, lp_delta=lp_delta, max_snapshot_age_days=max_snapshot_age_days
+    )
 
     empty = pd.DataFrame(columns=list(METADATA_COLUMNS) + feature_columns() + [LABEL_COLUMN])
     if state.empty:
@@ -380,6 +417,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--out", default="data/processed/features.parquet")
     parser.add_argument("--lp-delta", type=float, default=DEFAULT_LP_DELTA)
     parser.add_argument(
+        "--max-snapshot-age-days", type=float, default=DEFAULT_MAX_SNAPSHOT_AGE_DAYS,
+        help="in reconstructed mode, drop pairs whose snapshot is older than this;"
+        " beyond it the result can no longer be undone without injecting the outcome",
+    )
+    parser.add_argument(
         "--allow-partial-teams", action="store_true",
         help="keep matches where fewer than 5 players per side have a rank",
     )
@@ -397,6 +439,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             mode=args.mode,
             lp_delta=args.lp_delta,
             require_full_teams=not args.allow_partial_teams,
+            max_snapshot_age_days=args.max_snapshot_age_days,
         )
 
     if table.empty:

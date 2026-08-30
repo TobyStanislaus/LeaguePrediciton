@@ -41,12 +41,19 @@ def populate(
     tier: str = "DIAMOND",
     division: str = "II",
     league_points: int = 50,
+    reflects_match: bool = True,
 ) -> None:
-    """Write one synthetic match plus a ladder snapshot that reflects its result.
+    """Write one synthetic match plus a ladder snapshot.
 
-    The snapshot is what Riot would return *after* the match: the winner's win
-    count is one higher than it was at kickoff. That is precisely the
-    contamination the reconstruction has to undo.
+    With ``reflects_match`` (the default) the snapshot is what Riot would return
+    shortly *after* the match: the winner's win count is one higher than it was
+    at kickoff. That is the contamination reconstruction has to undo.
+
+    With ``reflects_match=False`` the snapshot is stale -- taken long enough
+    after that the match's result is no longer identifiable in it (LP reset, a
+    new split, hundreds of intervening games). Counters are then identical
+    regardless of who won, and "undoing" the result would *inject* the outcome
+    rather than remove it.
     """
     winning_team = 100 if blue_wins else 200
     cache.add_match(
@@ -72,12 +79,15 @@ def populate(
     entries = []
     for i in range(10):
         player_won = (i < 5) == blue_wins
+        if reflects_match:
+            lp = league_points + (18 if player_won else -18)
+            wins = pre_wins + (1 if player_won else 0)
+            losses = pre_losses + (0 if player_won else 1)
+        else:
+            lp, wins, losses = league_points, pre_wins, pre_losses
         entries.append({
             "puuid": f"p{i}", "tier": tier, "rank_division": division,
-            "league_points": league_points + (18 if player_won else -18),
-            "wins": pre_wins + (1 if player_won else 0),
-            "losses": pre_losses + (0 if player_won else 1),
-            "hot_streak": False,
+            "league_points": lp, "wins": wins, "losses": losses, "hot_streak": False,
         })
     cache.add_league_entries(snapshot_id, entries)
 
@@ -151,11 +161,11 @@ def test_collected_data_contains_no_in_game_statistics(cache: Cache):
 # --------------------------------------------------------------------------
 
 
-def _features_for(tmp_path, mode: str, blue_wins: bool, **kwargs) -> pd.Series:
+def _features_for(tmp_path, mode: str, blue_wins: bool, build=None, **kwargs) -> pd.Series:
     db = tmp_path / f"{mode}-{blue_wins}.sqlite"
     with Cache(db) as cache:
         populate(cache, blue_wins=blue_wins, **kwargs)
-        table = build_feature_table(cache, mode=mode)
+        table = build_feature_table(cache, mode=mode, **(build or {}))
     assert len(table) == 1, f"expected one match row, got {len(table)}"
     return table.iloc[0][feature_columns()]
 
@@ -193,6 +203,72 @@ def test_naive_leak_points_the_expected_way(tmp_path):
     blue = _features_for(tmp_path, "naive", blue_wins=True)
     assert blue["diff_winrate_mean"] > 0
     assert blue["diff_lp_mean"] > 0
+
+
+# --------------------------------------------------------------------------
+# Stale snapshots: reconstruction's failure mode
+# --------------------------------------------------------------------------
+
+STALE = 60 * 24 * HOUR
+
+
+def test_stale_snapshots_are_dropped_not_reconstructed(cache: Cache):
+    """A snapshot months later no longer contains the match, so undoing is invalid."""
+    populate(cache, snapshot_at=KICKOFF + STALE, reflects_match=False)
+    assert build_feature_table(cache, mode="reconstructed").empty
+
+
+def test_fresh_snapshots_are_still_reconstructed(cache: Cache):
+    populate(cache, snapshot_at=KICKOFF + 24 * HOUR)
+    assert len(build_feature_table(cache, mode="reconstructed")) == 1
+
+
+def test_the_age_limit_is_configurable(cache: Cache):
+    populate(cache, snapshot_at=KICKOFF + 10 * 24 * HOUR)
+    assert build_feature_table(cache, mode="reconstructed").empty
+    assert len(
+        build_feature_table(cache, mode="reconstructed", max_snapshot_age_days=30.0)
+    ) == 1
+
+
+def test_reconstructing_a_stale_snapshot_would_inject_the_outcome(tmp_path):
+    """Regression for a real bug: this is *why* stale rows must be dropped.
+
+    With the age limit disabled and a snapshot that no longer reflects the
+    match, subtracting the result from LP does not remove the outcome -- it
+    writes it in, inverted. Flipping who won then changes the features, and a
+    model reads the label straight back off. Observed on real mixed-tier data
+    as 0.83 accuracy from an artefact.
+    """
+    disabled = {"max_snapshot_age_days": None}
+    blue = _features_for(
+        tmp_path, "reconstructed", blue_wins=True,
+        build=disabled, snapshot_at=KICKOFF + STALE, reflects_match=False,
+    )
+    red = _features_for(
+        tmp_path, "reconstructed", blue_wins=False,
+        build=disabled, snapshot_at=KICKOFF + STALE, reflects_match=False,
+    )
+
+    assert blue["diff_lp_mean"] != red["diff_lp_mean"], (
+        "if this no longer differs, the injection mechanism is gone and this "
+        "regression test can be simplified"
+    )
+    # And note the direction: the winning side's LP is pushed *down*, which is
+    # the inverted signature that gave the bug away.
+    assert blue["diff_lp_mean"] < 0 < red["diff_lp_mean"]
+
+
+def test_the_age_limit_removes_that_injection(tmp_path):
+    """The fix: with the limit on, the same stale data yields no rows at all."""
+    for blue_wins in (True, False):
+        db = tmp_path / f"stale-{blue_wins}.sqlite"
+        with Cache(db) as cache:
+            populate(
+                cache, blue_wins=blue_wins,
+                snapshot_at=KICKOFF + STALE, reflects_match=False,
+            )
+            assert build_feature_table(cache, mode="reconstructed").empty
 
 
 # --------------------------------------------------------------------------
