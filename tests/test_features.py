@@ -118,6 +118,9 @@ PRE_GAME_CONCEPTS = {
     # Champions are locked at champion select, and the winrate behind them is
     # built only from matches that finished before this one started.
     "champ_winrate": "the side's champions' winrate in strictly earlier matches",
+    # Mastery is accumulated before the game; the champion is locked at select.
+    "mastery_log_mean": "log mastery points on the champion locked at select",
+    "mastery_rank_mean": "that champion's rank within the player's own pool",
 }
 
 # Anything computed from what happened during the match.
@@ -171,7 +174,9 @@ def test_feature_columns_are_unique_and_stable():
     from features.build_features import (
         CHAMPION_FEATURES,
         INCLUDE_CHAMPION_FEATURES,
+        INCLUDE_MASTERY_FEATURES,
         INCLUDE_ROLE_FEATURES,
+        MASTERY_FEATURES,
         ROLE_FEATURES,
     )
 
@@ -181,8 +186,95 @@ def test_feature_columns_are_unique_and_stable():
         3 * len(TEAM_STATS)
         + (len(ROLE_FEATURES) if INCLUDE_ROLE_FEATURES else 0)
         + (len(CHAMPION_FEATURES) if INCLUDE_CHAMPION_FEATURES else 0)
+        + (len(MASTERY_FEATURES) if INCLUDE_MASTERY_FEATURES else 0)
     )
     assert len(columns) == expected
+
+
+def _mastery_frames(mastery_rows, asked, blue_champ=1, red_champ=1):
+    """RawFrames carrying one match plus a mastery table."""
+    from features.build_features import RawFrames
+
+    matches = pd.DataFrame([
+        {"match_id": "m", "game_start_ts": 100.0, "winning_team": 100}
+    ])
+    parts = []
+    for i in range(10):
+        parts.append({
+            "match_id": "m", "puuid": f"p{i}", "team_id": 100 if i < 5 else 200,
+            "team_position": None, "champion_id": blue_champ if i < 5 else red_champ,
+        })
+    return RawFrames(
+        matches=matches,
+        participants=pd.DataFrame(parts),
+        entries=pd.DataFrame(),
+        mastery=pd.DataFrame(mastery_rows),
+        mastery_players=frozenset(asked),
+    )
+
+
+def test_mastery_rewards_the_more_practised_side():
+    from features.build_features import mastery_features
+
+    rows = []
+    for i in range(10):
+        # Blue plays champion 1 with far more points than red on champion 2.
+        rows.append({"puuid": f"p{i}", "champion_id": 1 if i < 5 else 2,
+                     "mastery_points": 500_000 if i < 5 else 1_000})
+    frames = _mastery_frames(rows, [f"p{i}" for i in range(10)], blue_champ=1, red_champ=2)
+
+    out = mastery_features(frames)
+    assert out.loc["m", "diff_mastery_log_mean"] > 0
+    assert out.loc["m", "blue_mastery_log_mean"] > out.loc["m", "red_mastery_log_mean"]
+
+
+def test_a_player_never_asked_about_is_unknown_not_zero():
+    """Zero points would assert they have never played it; we simply do not know."""
+    from features.build_features import mastery_features
+
+    rows = [{"puuid": f"p{i}", "champion_id": 1, "mastery_points": 10_000} for i in range(5)]
+    # Only blue was asked about, so red cannot be summarised at all.
+    frames = _mastery_frames(rows, [f"p{i}" for i in range(5)])
+    assert mastery_features(frames).empty
+
+
+def test_an_asked_player_with_no_entry_counts_as_never_played():
+    from features.build_features import mastery_features
+
+    rows = [{"puuid": f"p{i}", "champion_id": 99, "mastery_points": 50_000}
+            for i in range(10)]
+    # Everyone was asked, but nobody has an entry for the champion actually played.
+    frames = _mastery_frames(rows, [f"p{i}" for i in range(10)], blue_champ=1, red_champ=1)
+    out = mastery_features(frames)
+    assert not out.empty
+    assert out.loc["m", "blue_mastery_log_mean"] == pytest.approx(0.0)
+    assert out.loc["m", "diff_mastery_log_mean"] == pytest.approx(0.0)
+
+
+def test_mastery_rank_is_within_the_player_pool():
+    from features.build_features import mastery_features
+
+    rows = []
+    for i in range(10):
+        # Champion 1 is each player's best; champion 2 their second.
+        rows.append({"puuid": f"p{i}", "champion_id": 1, "mastery_points": 100_000})
+        rows.append({"puuid": f"p{i}", "champion_id": 2, "mastery_points": 10_000})
+    frames = _mastery_frames(rows, [f"p{i}" for i in range(10)], blue_champ=1, red_champ=2)
+
+    out = mastery_features(frames)
+    assert out.loc["m", "blue_mastery_rank_mean"] == pytest.approx(1.0)
+    assert out.loc["m", "red_mastery_rank_mean"] == pytest.approx(2.0)
+    assert out.loc["m", "diff_mastery_rank_mean"] == pytest.approx(-1.0)
+
+
+def test_a_partly_known_side_is_not_summarised():
+    """A three-player average is a different quantity under the same name."""
+    from features.build_features import mastery_features
+
+    rows = [{"puuid": f"p{i}", "champion_id": 1, "mastery_points": 5_000} for i in range(10)]
+    asked = [f"p{i}" for i in range(10) if i != 3]  # one blue player missing
+    frames = _mastery_frames(rows, asked)
+    assert mastery_features(frames).empty
 
 
 def test_champion_winrate_ignores_the_match_being_scored():

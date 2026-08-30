@@ -1,4 +1,4 @@
-"""Turn collected matches and ladder snapshots into a team-level, pre-game feature table.
+﻿"""Turn collected matches and ladder snapshots into a team-level, pre-game feature table.
 
 One row per match. Every feature is derived from state knowable **before**
 kickoff: rank, LP, winrate, hot-streak flag, and the spread of rank within a
@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal
 
@@ -142,6 +142,36 @@ CHAMPION_FEATURES = ("blue_champ_winrate", "red_champ_winrate", "diff_champ_winr
 # calls for this dataset, so it is a deliberate decision rather than a free one.
 INCLUDE_CHAMPION_FEATURES = False
 
+# Champion mastery: how practised each player is on the champion they locked.
+# This is the proficiency signal champion identity failed to carry.
+#
+# Mastery points are read now and grow with every game, a win awarding more than
+# a loss, so a raw total carries a faint trace of the match being predicted --
+# the same shape of problem as a current ladder snapshot, roughly two orders of
+# magnitude smaller. Both features below are chosen to blunt it: a log scale
+# makes one game's points negligible, and a champion's rank within a player's
+# own pool almost never moves on a single game.
+MASTERY_FEATURES = (
+    "blue_mastery_log_mean",
+    "red_mastery_log_mean",
+    "diff_mastery_log_mean",
+    "blue_mastery_rank_mean",
+    "red_mastery_rank_mean",
+    "diff_mastery_rank_mean",
+)
+#
+# Status: promising, not yet established. On the 464 matches with full coverage
+# (22% of the table, 6,000 of 15,595 players fetched), a rolling-origin ablation
+# gave a mean accuracy gain of +0.0215 with 4 of 5 folds improving -- but a
+# standard error of 0.0207, so about one sigma. For contrast, role features
+# improved 1 fold of 6 and champion winrate 2 of 6.
+#
+# The covered subset is also not a fair sample: base accuracy on it is ~0.70
+# against ~0.63 overall, because a match only qualifies when all ten players are
+# among the most recently active. Fuller coverage is being collected to settle
+# this; revisit the switch when it lands.
+INCLUDE_MASTERY_FEATURES = True
+
 # Beta prior strength for champion winrates. A champion seen five times should
 # not be credited with an 80% winrate, so estimates shrink toward 0.5 until the
 # sample earns otherwise.
@@ -157,6 +187,8 @@ def feature_columns() -> list[str]:
         columns += list(ROLE_FEATURES)
     if INCLUDE_CHAMPION_FEATURES:
         columns += list(CHAMPION_FEATURES)
+    if INCLUDE_MASTERY_FEATURES:
+        columns += list(MASTERY_FEATURES)
     return columns
 
 
@@ -196,6 +228,8 @@ class RawFrames:
     matches: pd.DataFrame
     participants: pd.DataFrame
     entries: pd.DataFrame
+    mastery: pd.DataFrame = field(default_factory=pd.DataFrame)
+    mastery_players: frozenset[str] = frozenset()
 
 
 def load_frames(cache: Cache) -> RawFrames:
@@ -213,7 +247,24 @@ def load_frames(cache: Cache) -> RawFrames:
         " captured_at FROM league_entries",
         cache.conn,
     )
-    return RawFrames(matches=matches, participants=participants, entries=entries)
+    mastery = pd.read_sql_query(
+        "SELECT puuid, champion_id, mastery_points FROM champion_mastery", cache.conn
+    )
+    # Players we actually asked about. A player who was asked but has no entry
+    # for a champion has genuinely never played it (0 points); a player we never
+    # asked about is simply unknown, and the two must not be confused.
+    asked = pd.read_sql_query(
+        "SELECT SUBSTR(key, 9) AS puuid FROM collection_progress WHERE key LIKE 'mastery:%'",
+        cache.conn,
+    )
+
+    return RawFrames(
+        matches=matches,
+        participants=participants,
+        entries=entries,
+        mastery=mastery,
+        mastery_players=frozenset(asked["puuid"]),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -499,10 +550,77 @@ def champion_prior_winrates(
     return pd.DataFrame(rows).set_index("match_id")
 
 
+def mastery_features(frames: RawFrames) -> pd.DataFrame:
+    """Per-side champion-mastery summaries, indexed by match_id.
+
+    Two views of the same thing, both blunt to a single game's contribution:
+
+    * ``mastery_log_mean`` -- mean of ``log1p(points)`` on the champion played.
+    * ``mastery_rank_mean`` -- mean rank of that champion inside the player's
+      own pool, 1 being their most-played. Lower is more comfortable.
+
+    A player we asked about who has no row for a champion has never played it,
+    which is 0 points and a rank past the end of their pool. A player we never
+    asked about is NaN -- unknown is not the same as zero.
+    """
+    empty = pd.DataFrame(columns=list(MASTERY_FEATURES))
+    if frames.mastery.empty or not frames.mastery_players:
+        return empty
+
+    mastery = frames.mastery.copy()
+    mastery["champion_id"] = mastery["champion_id"].astype("int64")
+    mastery["mastery_points"] = mastery["mastery_points"].fillna(0).astype("float64")
+    mastery["mastery_rank"] = (
+        mastery.groupby("puuid")["mastery_points"].rank(ascending=False, method="min")
+    )
+    pool_size = mastery.groupby("puuid")["champion_id"].size().rename("pool_size")
+
+    played = frames.participants.dropna(subset=["champion_id"]).copy()
+    played["champion_id"] = played["champion_id"].astype("int64")
+    played = played[played["puuid"].isin(frames.mastery_players)]
+    if played.empty:
+        return empty
+
+    played = played.merge(
+        mastery[["puuid", "champion_id", "mastery_points", "mastery_rank"]],
+        on=["puuid", "champion_id"],
+        how="left",
+    ).merge(pool_size, on="puuid", how="left")
+
+    # Asked-about players with no entry: never played it.
+    played["mastery_points"] = played["mastery_points"].fillna(0.0)
+    played["mastery_rank"] = played["mastery_rank"].fillna(played["pool_size"] + 1)
+    played["mastery_log"] = np.log1p(played["mastery_points"])
+
+    grouped = played.groupby(["match_id", "team_id"]).agg(
+        mastery_log_mean=("mastery_log", "mean"),
+        mastery_rank_mean=("mastery_rank", "mean"),
+        players=("puuid", "count"),
+    ).reset_index()
+    # Only summarise a side we saw all five of; a three-player average is a
+    # different quantity wearing the same column name.
+    grouped = grouped[grouped["players"] == 5]
+
+    blue = grouped[grouped["team_id"] == BLUE].set_index("match_id")
+    red = grouped[grouped["team_id"] == RED].set_index("match_id")
+    both = blue.index.intersection(red.index)
+    if len(both) == 0:
+        return empty
+
+    blue, red = blue.loc[both], red.loc[both]
+    out = pd.DataFrame(index=both)
+    for stat in ("mastery_log_mean", "mastery_rank_mean"):
+        out[f"blue_{stat}"] = blue[stat]
+        out[f"red_{stat}"] = red[stat]
+        out[f"diff_{stat}"] = blue[stat] - red[stat]
+    return out
+
+
 def pivot_team_features(
     teams: pd.DataFrame,
     roles: pd.DataFrame | None = None,
     champions: pd.DataFrame | None = None,
+    mastery: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Turn per-(match, team) aggregates into one row per match.
 
@@ -534,6 +652,13 @@ def pivot_team_features(
         for column in CHAMPION_FEATURES:
             if champions is not None and column in champions:
                 table[column] = champions.reindex(both)[column]
+            else:
+                table[column] = np.nan
+
+    if INCLUDE_MASTERY_FEATURES:
+        for column in MASTERY_FEATURES:
+            if mastery is not None and column in mastery:
+                table[column] = mastery.reindex(both)[column]
             else:
                 table[column] = np.nan
 
@@ -605,6 +730,7 @@ def build_feature_table(
         # Built from every collected match, not only the usable ones: more
         # history behind each winrate, and still strictly past-only.
         champions=champion_prior_winrates(frames.matches, frames.participants),
+        mastery=mastery_features(frames),
     )
     if table.empty:
         log.warning("no match has both teams fully resolved")

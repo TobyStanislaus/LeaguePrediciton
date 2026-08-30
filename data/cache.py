@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS match_participants (
 );
 CREATE INDEX IF NOT EXISTS ix_participants_puuid ON match_participants (puuid);
 
+CREATE TABLE IF NOT EXISTS champion_mastery (
+    puuid          TEXT    NOT NULL,
+    champion_id    INTEGER NOT NULL,
+    mastery_points INTEGER,
+    mastery_level  INTEGER,
+    last_play_time REAL,
+    fetched_at     REAL    NOT NULL,
+    PRIMARY KEY (puuid, champion_id)
+);
+CREATE INDEX IF NOT EXISTS ix_mastery_puuid ON champion_mastery (puuid);
+
 CREATE TABLE IF NOT EXISTS collection_progress (
     key        TEXT PRIMARY KEY,
     value      TEXT,
@@ -270,6 +281,42 @@ class Cache:
 
     def league_entry_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) AS n FROM league_entries").fetchone()["n"])
+
+    # -- champion mastery --------------------------------------------------
+
+    def add_champion_masteries(self, puuid: str, entries: Iterable[dict[str, Any]]) -> int:
+        """Store one player's champion masteries. Zero entries still marks them done."""
+        now = time.time()
+        rows = [
+            (
+                puuid,
+                int(e["championId"]),
+                e.get("championPoints"),
+                e.get("championLevel"),
+                (e.get("lastPlayTime") or 0) / 1000.0 or None,
+                now,
+            )
+            for e in entries
+            if e.get("championId") is not None
+        ]
+        if rows:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO champion_mastery (puuid, champion_id, mastery_points,"
+                " mastery_level, last_play_time, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        self.mark_done(f"mastery:{puuid}")
+        return len(rows)
+
+    def has_mastery(self, puuid: str) -> bool:
+        return self.is_done(f"mastery:{puuid}")
+
+    def mastery_player_count(self) -> int:
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM collection_progress WHERE key LIKE 'mastery:%'"
+            ).fetchone()["n"]
+        )
 
     # -- resume support ----------------------------------------------------
 

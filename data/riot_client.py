@@ -435,6 +435,24 @@ class RiotClient:
             max_age=TTL_LADDER,
         )
 
+    # -- CHAMPION-MASTERY-V4 -----------------------------------------------
+
+    def get_champion_masteries(self, puuid: str) -> list[dict[str, Any]]:
+        """Every champion mastery entry for a player, in one call.
+
+        Mastery points accrue with every game played on a champion, and a win
+        awards more than a loss, so a mastery total read *after* a match carries
+        a faint trace of that match's result. One game is a fraction of a
+        percent of a typical total, but features built from this should prefer
+        log-scaled or rank-based forms over raw points.
+        """
+        return self._get(
+            f"{self.platform}.api.riotgames.com",
+            f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}",
+            endpoint="champion-mastery-v4.by-puuid",
+            max_age=TTL_LADDER,
+        )
+
     # -- SPECTATOR-V5 ------------------------------------------------------
 
     def get_active_game(self, puuid: str) -> dict[str, Any]:
