@@ -107,11 +107,56 @@ METADATA_COLUMNS = ("match_id", "game_start_ts", "queue_id", "game_version", "le
 LABEL_COLUMN = "blue_win"
 
 
+# Role-aware features. Team averages hide *where* a rank gap sits, and a two
+# hundred point edge in the jungle is not the same game as the same edge in
+# support. Riot assigns these at champion select, so they are pre-game.
+ROLES = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY")
+ROLE_FEATURES = tuple(f"role_diff_{role.lower()}" for role in ROLES) + ("role_diff_spread",)
+
+# Measured, not assumed: a rolling-origin ablation over six sequential folds on
+# 2,113 matches gave a mean accuracy gain of -0.011 (improving in 1 fold of 6),
+# with log loss and AUC flat. A single split had suggested +0.022, which turned
+# out to be split luck.
+#
+# They also cost something at prediction time: SPECTATOR-V5 reports no assigned
+# roles, so a live game leaves all six columns to the imputer.
+#
+# The code and tests are kept so the result is reproducible and the switch is
+# one line if better data changes the answer.
+INCLUDE_ROLE_FEATURES = False
+
+# Champion-select features: how strong each side's five champions have been,
+# from *earlier* matches only. Champions are locked before the game starts, so
+# this is pre-game -- provided the winrate is built strictly from the past.
+CHAMPION_FEATURES = ("blue_champ_winrate", "red_champ_winrate", "diff_champ_winrate")
+
+# Also measured, also negative: mean accuracy gain -0.0024 (se 0.0047) over the
+# same six folds, AUC -0.0007, and diff_champ_winrate correlates with the label
+# at 0.004.
+#
+# The reason is structural rather than a bug. Riot balances champions to roughly
+# even winrates, the spread across 173 of them is small, and averaging five per
+# side cancels most of what remains: the resulting diff has a standard deviation
+# of 0.019. Champion *identity* is not the signal. Player proficiency on that
+# champion plausibly is, and that needs CHAMPION-MASTERY-V4 -- about 15,600
+# calls for this dataset, so it is a deliberate decision rather than a free one.
+INCLUDE_CHAMPION_FEATURES = False
+
+# Beta prior strength for champion winrates. A champion seen five times should
+# not be credited with an 80% winrate, so estimates shrink toward 0.5 until the
+# sample earns otherwise.
+CHAMPION_PRIOR_STRENGTH = 25.0
+
+
 def feature_columns() -> list[str]:
     """The exact set of model input columns, in a stable order."""
     columns = [f"blue_{stat}" for stat in TEAM_STATS]
     columns += [f"red_{stat}" for stat in TEAM_STATS]
     columns += [f"diff_{stat}" for stat in TEAM_STATS]
+    if INCLUDE_ROLE_FEATURES:
+        columns += list(ROLE_FEATURES)
+    if INCLUDE_CHAMPION_FEATURES:
+        columns += list(CHAMPION_FEATURES)
     return columns
 
 
@@ -160,7 +205,8 @@ def load_frames(cache: Cache) -> RawFrames:
         cache.conn,
     )
     participants = pd.read_sql_query(
-        "SELECT match_id, puuid, team_id FROM match_participants", cache.conn
+        "SELECT match_id, puuid, team_id, team_position, champion_id FROM match_participants",
+        cache.conn,
     )
     entries = pd.read_sql_query(
         "SELECT puuid, tier, rank_division, league_points, wins, losses, hot_streak,"
@@ -344,11 +390,124 @@ def aggregate_teams(state: pd.DataFrame, require_full_teams: bool = True) -> pd.
     return teams
 
 
-def pivot_team_features(teams: pd.DataFrame) -> pd.DataFrame:
+def role_features(state: pd.DataFrame) -> pd.DataFrame:
+    """Per-role rank gaps: blue's player minus red's, lane by lane.
+
+    Indexed by match_id, one column per role plus the spread between the
+    largest and smallest gap -- a team ahead everywhere plays differently from
+    one ahead in two lanes and behind in two.
+
+    Roles Riot did not label come back as NaN rather than 0: a missing gap is
+    unknown, and zero would assert the lanes were even.
+    """
+    empty = pd.DataFrame(columns=list(ROLE_FEATURES))
+    if "team_position" not in state.columns or state.empty:
+        return empty
+
+    labelled = state[state["team_position"].isin(ROLES)]
+    if labelled.empty:
+        return empty
+
+    # Mean guards against the rare duplicate role within one team.
+    per_side = labelled.groupby(["match_id", "team_position", "team_id"])[
+        "rank_points"
+    ].mean()
+    wide = per_side.unstack("team_id")
+    if BLUE not in wide.columns or RED not in wide.columns:
+        return empty
+
+    gaps = (wide[BLUE] - wide[RED]).unstack("team_position")
+    gaps = gaps.reindex(columns=list(ROLES))
+    gaps.columns = [f"role_diff_{role.lower()}" for role in gaps.columns]
+
+    gaps["role_diff_spread"] = gaps.max(axis=1) - gaps.min(axis=1)
+    return gaps
+
+
+def champion_prior_winrates(
+    matches: pd.DataFrame,
+    participants: pd.DataFrame,
+    alpha: float = CHAMPION_PRIOR_STRENGTH,
+) -> pd.DataFrame:
+    """Mean champion winrate per side, computed from strictly earlier matches.
+
+    Walks matches in kickoff order, reads each champion's record *before*
+    scoring the match, and only then folds that match's result in. A winrate
+    computed over the whole dataset would include the outcome being predicted --
+    the same mistake as joining a current ladder snapshot onto a past game, in a
+    different costume.
+
+    Estimates are shrunk toward 0.5 by a Beta(alpha, alpha) prior so a champion
+    with four games does not arrive claiming a 75% winrate.
+    """
+    empty = pd.DataFrame(columns=list(CHAMPION_FEATURES))
+    needed = {"match_id", "game_start_ts", "winning_team"}
+    if matches.empty or participants.empty or not needed <= set(matches.columns):
+        return empty
+    if "champion_id" not in participants.columns:
+        return empty
+
+    ordered = matches.dropna(subset=["game_start_ts", "winning_team"]).sort_values(
+        "game_start_ts"
+    )
+    by_match: dict[str, list[tuple[int, int]]] = {}
+    for match_id, team_id, champion_id in zip(
+        participants["match_id"], participants["team_id"], participants["champion_id"]
+    ):
+        if champion_id is None or pd.isna(champion_id):
+            continue
+        by_match.setdefault(match_id, []).append((int(team_id), int(champion_id)))
+
+    wins: dict[int, float] = {}
+    games: dict[int, float] = {}
+    rows = []
+
+    for match_id, winning_team in zip(ordered["match_id"], ordered["winning_team"]):
+        squad = by_match.get(match_id)
+        if not squad:
+            continue
+
+        sides: dict[int, list[float]] = {BLUE: [], RED: []}
+        for team_id, champion_id in squad:
+            if team_id not in sides:
+                continue
+            prior = (wins.get(champion_id, 0.0) + alpha) / (
+                games.get(champion_id, 0.0) + 2 * alpha
+            )
+            sides[team_id].append(prior)
+
+        if sides[BLUE] and sides[RED]:
+            blue_mean = float(np.mean(sides[BLUE]))
+            red_mean = float(np.mean(sides[RED]))
+            rows.append(
+                {
+                    "match_id": match_id,
+                    "blue_champ_winrate": blue_mean,
+                    "red_champ_winrate": red_mean,
+                    "diff_champ_winrate": blue_mean - red_mean,
+                }
+            )
+
+        # Only now does this match count toward the running record.
+        for team_id, champion_id in squad:
+            games[champion_id] = games.get(champion_id, 0.0) + 1.0
+            if team_id == winning_team:
+                wins[champion_id] = wins.get(champion_id, 0.0) + 1.0
+
+    if not rows:
+        return empty
+    return pd.DataFrame(rows).set_index("match_id")
+
+
+def pivot_team_features(
+    teams: pd.DataFrame,
+    roles: pd.DataFrame | None = None,
+    champions: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Turn per-(match, team) aggregates into one row per match.
 
-    Produces ``blue_*``, ``red_*`` and ``diff_*`` columns. Matches missing
-    either side are dropped.
+    Produces ``blue_*``, ``red_*``, ``diff_*`` and ``role_diff_*`` columns.
+    Matches missing either side are dropped.
     """
     blue = teams[teams["team_id"] == BLUE].set_index("match_id")
     red = teams[teams["team_id"] == RED].set_index("match_id")
@@ -362,6 +521,21 @@ def pivot_team_features(teams: pd.DataFrame) -> pd.DataFrame:
         table[f"blue_{stat}"] = blue[stat]
         table[f"red_{stat}"] = red[stat]
         table[f"diff_{stat}"] = blue[stat] - red[stat]
+
+    if INCLUDE_ROLE_FEATURES:
+        for column in ROLE_FEATURES:
+            if roles is not None and column in roles:
+                table[column] = roles.reindex(both)[column]
+            else:
+                # Live prediction has no role labels (see features_for_players).
+                table[column] = np.nan
+
+    if INCLUDE_CHAMPION_FEATURES:
+        for column in CHAMPION_FEATURES:
+            if champions is not None and column in champions:
+                table[column] = champions.reindex(both)[column]
+            else:
+                table[column] = np.nan
 
     # Return in the declared order, not construction order. A model fed these
     # columns in a different order than it was fitted on produces confident
@@ -379,6 +553,11 @@ def features_for_players(
 
     ``players`` needs ``puuid``, ``team_id`` (100/200), ``tier``,
     ``rank_division``, ``league_points``, ``wins``, ``losses``, ``hot_streak``.
+    An optional ``team_position`` enables the role features.
+
+    SPECTATOR-V5 does not report assigned roles, so a live prediction leaves
+    ``role_diff_*`` as NaN for the imputer to fill. Those predictions are
+    therefore made on fewer effective features than the model was trained with.
     """
     required = {
         "puuid", "team_id", "tier", "rank_division", "league_points",
@@ -390,10 +569,12 @@ def features_for_players(
 
     players = players.copy()
     players["match_id"] = match_id
-    teams = aggregate_teams(
-        derive_player_metrics(players), require_full_teams=require_full_teams
-    )
-    return pivot_team_features(teams)
+    if "team_position" not in players.columns:
+        players["team_position"] = None
+
+    state = derive_player_metrics(players)
+    teams = aggregate_teams(state, require_full_teams=require_full_teams)
+    return pivot_team_features(teams, roles=role_features(state))
 
 
 def build_feature_table(
@@ -418,7 +599,13 @@ def build_feature_table(
     if teams.empty:
         return empty
 
-    table = pivot_team_features(teams)
+    table = pivot_team_features(
+        teams,
+        roles=role_features(state),
+        # Built from every collected match, not only the usable ones: more
+        # history behind each winrate, and still strictly past-only.
+        champions=champion_prior_winrates(frames.matches, frames.participants),
+    )
     if table.empty:
         log.warning("no match has both teams fully resolved")
         return empty
@@ -433,6 +620,17 @@ def build_feature_table(
 
     table = table.reset_index().rename(columns={"index": "match_id"})
     table = table.sort_values("game_start_ts").reset_index(drop=True)
+
+    # An all-NaN feature is imputed to a constant and contributes nothing, but
+    # it looks like a working column: an ablation against it reports an exactly
+    # zero effect rather than a bug. Caught exactly that way once, when a source
+    # query was missing champion_id.
+    dead = [c for c in feature_columns() if table[c].isna().all()]
+    if dead:
+        log.warning(
+            "these feature columns are entirely NaN and carry no information: %s",
+            ", ".join(dead),
+        )
 
     ordered = list(METADATA_COLUMNS) + feature_columns() + [LABEL_COLUMN]
     return table[ordered]

@@ -1,4 +1,4 @@
-"""Feature-building tests, with data leakage as the central concern."""
+﻿"""Feature-building tests, with data leakage as the central concern."""
 
 from __future__ import annotations
 
@@ -108,6 +108,16 @@ PRE_GAME_CONCEPTS = {
     "winrate_mean": "wins/(wins+losses) accumulated before the game",
     "games_mean": "ranked games played before the game",
     "hot_streak_count": "Riot hot-streak flag, set before the game",
+    # Roles are assigned at champion select, before the game starts.
+    "role_diff_top": "top-lane ladder gap, roles known at champion select",
+    "role_diff_jungle": "jungle ladder gap, roles known at champion select",
+    "role_diff_middle": "mid-lane ladder gap, roles known at champion select",
+    "role_diff_bottom": "bot-lane ladder gap, roles known at champion select",
+    "role_diff_utility": "support ladder gap, roles known at champion select",
+    "role_diff_spread": "how unevenly the ladder gaps are spread across roles",
+    # Champions are locked at champion select, and the winrate behind them is
+    # built only from matches that finished before this one started.
+    "champ_winrate": "the side's champions' winrate in strictly earlier matches",
 }
 
 # Anything computed from what happened during the match.
@@ -158,9 +168,132 @@ def test_every_builder_emits_columns_in_the_declared_order():
 
 
 def test_feature_columns_are_unique_and_stable():
+    from features.build_features import (
+        CHAMPION_FEATURES,
+        INCLUDE_CHAMPION_FEATURES,
+        INCLUDE_ROLE_FEATURES,
+        ROLE_FEATURES,
+    )
+
     columns = feature_columns()
     assert len(columns) == len(set(columns))
-    assert len(columns) == 3 * len(TEAM_STATS)
+    expected = (
+        3 * len(TEAM_STATS)
+        + (len(ROLE_FEATURES) if INCLUDE_ROLE_FEATURES else 0)
+        + (len(CHAMPION_FEATURES) if INCLUDE_CHAMPION_FEATURES else 0)
+    )
+    assert len(columns) == expected
+
+
+def test_champion_winrate_ignores_the_match_being_scored():
+    """The decisive property: a match must not inform its own champion winrate.
+
+    Two identical fixtures differing only in who won must give the first match
+    identical champion features -- it has no history to draw on either way.
+    """
+    from features.build_features import champion_prior_winrates
+
+    def build(first_winner: int) -> pd.DataFrame:
+        matches = pd.DataFrame([
+            {"match_id": "m1", "game_start_ts": 100.0, "winning_team": first_winner},
+            {"match_id": "m2", "game_start_ts": 200.0, "winning_team": 100},
+        ])
+        parts = []
+        for match_id in ("m1", "m2"):
+            for i in range(10):
+                parts.append({"match_id": match_id, "team_id": 100 if i < 5 else 200,
+                              "champion_id": i})
+        return champion_prior_winrates(matches, pd.DataFrame(parts))
+
+    blue_first = build(100)
+    red_first = build(200)
+    assert blue_first.loc["m1", "diff_champ_winrate"] == pytest.approx(
+        red_first.loc["m1", "diff_champ_winrate"]
+    )
+    # The second match *does* differ, because by then the first match is history.
+    assert blue_first.loc["m2", "diff_champ_winrate"] != pytest.approx(
+        red_first.loc["m2", "diff_champ_winrate"]
+    )
+
+
+def test_champion_winrates_shrink_toward_a_coin_flip_when_unseen():
+    from features.build_features import champion_prior_winrates
+
+    matches = pd.DataFrame([{"match_id": "m1", "game_start_ts": 1.0, "winning_team": 100}])
+    parts = [
+        {"match_id": "m1", "team_id": 100 if i < 5 else 200, "champion_id": i}
+        for i in range(10)
+    ]
+    out = champion_prior_winrates(matches, pd.DataFrame(parts))
+    assert out.loc["m1", "blue_champ_winrate"] == pytest.approx(0.5)
+    assert out.loc["m1", "diff_champ_winrate"] == pytest.approx(0.0)
+
+
+def test_a_repeatedly_winning_champion_earns_a_higher_winrate():
+    from features.build_features import champion_prior_winrates
+
+    matches, parts = [], []
+    for k in range(40):
+        matches.append({"match_id": f"m{k}", "game_start_ts": float(k), "winning_team": 100})
+        for i in range(10):
+            parts.append({"match_id": f"m{k}", "team_id": 100 if i < 5 else 200,
+                          "champion_id": i})
+    out = champion_prior_winrates(pd.DataFrame(matches), pd.DataFrame(parts))
+    # Blue's champions always won, so by the last match blue's prior leads.
+    assert out.loc["m39", "diff_champ_winrate"] > 0.2
+
+
+def test_role_gaps_are_signed_towards_blue():
+    """A stronger blue jungler must produce a positive jungle gap."""
+    from features.build_features import ROLES, role_features
+
+    rows = []
+    for i, role in enumerate(ROLES):
+        rows.append({"match_id": "m", "team_id": 100, "team_position": role,
+                     "rank_points": 2000 + (500 if role == "JUNGLE" else 0)})
+        rows.append({"match_id": "m", "team_id": 200, "team_position": role,
+                     "rank_points": 2000})
+
+    gaps = role_features(pd.DataFrame(rows))
+    assert gaps.loc["m", "role_diff_jungle"] == pytest.approx(500)
+    assert gaps.loc["m", "role_diff_top"] == pytest.approx(0)
+    assert gaps.loc["m", "role_diff_spread"] == pytest.approx(500)
+
+
+def test_unlabelled_roles_become_nan_not_zero():
+    """Zero would assert the lanes were even; the truth is that we do not know."""
+    from features.build_features import role_features
+
+    rows = [
+        {"match_id": "m", "team_id": 100, "team_position": "TOP", "rank_points": 2500},
+        {"match_id": "m", "team_id": 200, "team_position": "TOP", "rank_points": 2000},
+    ]
+    gaps = role_features(pd.DataFrame(rows))
+    assert gaps.loc["m", "role_diff_top"] == pytest.approx(500)
+    assert np.isnan(gaps.loc["m", "role_diff_jungle"])
+
+
+def test_role_features_absent_from_live_players_are_nan(cache: Cache):
+    """SPECTATOR-V5 reports no roles, so live predictions must still build."""
+    from features.build_features import (
+        INCLUDE_ROLE_FEATURES,
+        ROLE_FEATURES,
+        features_for_players,
+    )
+
+    if not INCLUDE_ROLE_FEATURES:
+        pytest.skip("role features are disabled -- see the ablation note in build_features")
+
+    players = pd.DataFrame([
+        {"puuid": f"p{i}", "team_id": 100 if i < 5 else 200, "tier": "DIAMOND",
+         "rank_division": "II", "league_points": 50, "wins": 100, "losses": 90,
+         "hot_streak": False}
+        for i in range(10)
+    ])
+    features = features_for_players(players)
+    assert list(features.columns) == feature_columns()
+    for column in ROLE_FEATURES:
+        assert features[column].isna().all()
 
 
 def test_collected_data_contains_no_in_game_statistics(cache: Cache):
