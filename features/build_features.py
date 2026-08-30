@@ -168,9 +168,21 @@ MASTERY_FEATURES = (
 #
 # The covered subset is also not a fair sample: base accuracy on it is ~0.70
 # against ~0.63 overall, because a match only qualifies when all ten players are
-# among the most recently active. Fuller coverage is being collected to settle
-# this; revisit the switch when it lands.
-INCLUDE_MASTERY_FEATURES = True
+# among the most recently active.
+#
+# DISABLED until coverage is uniform across time. Collection visits players
+# newest-match-first, which is right for spending a partial budget but produces
+# a savage train/test shift while it is incomplete: at 6,000 of 15,595 players
+# the chronological split had 0.2% mastery coverage in training, 9.5% in
+# validation and 100% in test. The model fitted a coefficient against an imputed
+# constant, then met real values in test and scored a log loss of 7.44 against a
+# coin flip's 0.69.
+#
+# The lesson generalises: a feature that is missing-at-random is a nuisance, but
+# one whose missingness correlates with time breaks a time-ordered split
+# outright. Re-enable once every split has comparable coverage, then re-run the
+# ablation.
+INCLUDE_MASTERY_FEATURES = False
 
 # Beta prior strength for champion winrates. A champion seen five times should
 # not be credited with an 80% winrate, so estimates shrink toward 0.5 until the
@@ -550,7 +562,11 @@ def champion_prior_winrates(
     return pd.DataFrame(rows).set_index("match_id")
 
 
-def mastery_features(frames: RawFrames) -> pd.DataFrame:
+def mastery_features(
+    participants: pd.DataFrame,
+    mastery_table: pd.DataFrame,
+    asked: frozenset[str] | set[str],
+) -> pd.DataFrame:
     """Per-side champion-mastery summaries, indexed by match_id.
 
     Two views of the same thing, both blunt to a single game's contribution:
@@ -564,10 +580,10 @@ def mastery_features(frames: RawFrames) -> pd.DataFrame:
     asked about is NaN -- unknown is not the same as zero.
     """
     empty = pd.DataFrame(columns=list(MASTERY_FEATURES))
-    if frames.mastery.empty or not frames.mastery_players:
+    if mastery_table.empty or not asked:
         return empty
 
-    mastery = frames.mastery.copy()
+    mastery = mastery_table.copy()
     mastery["champion_id"] = mastery["champion_id"].astype("int64")
     mastery["mastery_points"] = mastery["mastery_points"].fillna(0).astype("float64")
     mastery["mastery_rank"] = (
@@ -575,9 +591,9 @@ def mastery_features(frames: RawFrames) -> pd.DataFrame:
     )
     pool_size = mastery.groupby("puuid")["champion_id"].size().rename("pool_size")
 
-    played = frames.participants.dropna(subset=["champion_id"]).copy()
+    played = participants.dropna(subset=["champion_id"]).copy()
     played["champion_id"] = played["champion_id"].astype("int64")
-    played = played[played["puuid"].isin(frames.mastery_players)]
+    played = played[played["puuid"].isin(asked)]
     if played.empty:
         return empty
 
@@ -669,7 +685,10 @@ def pivot_team_features(
 
 
 def features_for_players(
-    players: pd.DataFrame, match_id: str = "live", require_full_teams: bool = True
+    players: pd.DataFrame,
+    match_id: str = "live",
+    require_full_teams: bool = True,
+    mastery_table: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build one feature row from ten players' current ranked state.
 
@@ -696,10 +715,21 @@ def features_for_players(
     players["match_id"] = match_id
     if "team_position" not in players.columns:
         players["team_position"] = None
+    if "champion_id" not in players.columns:
+        players["champion_id"] = np.nan
 
     state = derive_player_metrics(players)
     teams = aggregate_teams(state, require_full_teams=require_full_teams)
-    return pivot_team_features(teams, roles=role_features(state))
+
+    mastery = None
+    if mastery_table is not None and not mastery_table.empty:
+        mastery = mastery_features(
+            players[["match_id", "puuid", "team_id", "champion_id"]],
+            mastery_table,
+            asked=frozenset(mastery_table["puuid"].unique()),
+        )
+
+    return pivot_team_features(teams, roles=role_features(state), mastery=mastery)
 
 
 def build_feature_table(
@@ -730,7 +760,9 @@ def build_feature_table(
         # Built from every collected match, not only the usable ones: more
         # history behind each winrate, and still strictly past-only.
         champions=champion_prior_winrates(frames.matches, frames.participants),
-        mastery=mastery_features(frames),
+        mastery=mastery_features(
+            frames.participants, frames.mastery, frames.mastery_players
+        ),
     )
     if table.empty:
         log.warning("no match has both teams fully resolved")

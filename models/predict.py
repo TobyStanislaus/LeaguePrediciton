@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
@@ -79,7 +79,10 @@ def ranked_entry(client: RiotClient, puuid: str, queue: str = RANKED_SOLO) -> di
 
 
 def gather_players(
-    client: RiotClient, blue: Sequence[str], red: Sequence[str]
+    client: RiotClient,
+    blue: Sequence[str],
+    red: Sequence[str],
+    champions: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Build the ten-row player frame the feature builder expects."""
     rows = []
@@ -87,6 +90,7 @@ def gather_players(
         for puuid in puuids:
             entry = ranked_entry(client, puuid)
             entry["team_id"] = team_id
+            entry["champion_id"] = (champions or {}).get(puuid)
             rows.append(entry)
     return pd.DataFrame(rows)
 
@@ -117,6 +121,7 @@ class LiveTeams:
     red: list[str]
     hidden_blue: int
     hidden_red: int
+    champions: dict[str, int] = field(default_factory=dict)
 
     @property
     def hidden(self) -> int:
@@ -127,6 +132,7 @@ def teams_from_active_game(game: dict[str, Any]) -> LiveTeams:
     """Split a SPECTATOR-V5 payload into blue and red PUUIDs, counting hidden ones."""
     sides: dict[int, list[str]] = {BLUE: [], RED: []}
     hidden = {BLUE: 0, RED: 0}
+    champions: dict[str, int] = {}
 
     for participant in game.get("participants", []):
         team = participant.get("teamId")
@@ -135,10 +141,37 @@ def teams_from_active_game(game: dict[str, Any]) -> LiveTeams:
         puuid = participant.get("puuid")
         if puuid:
             sides[team].append(puuid)
+            if participant.get("championId") is not None:
+                champions[puuid] = int(participant["championId"])
         else:
             hidden[team] += 1
 
-    return LiveTeams(sides[BLUE], sides[RED], hidden[BLUE], hidden[RED])
+    return LiveTeams(sides[BLUE], sides[RED], hidden[BLUE], hidden[RED], champions)
+
+
+def gather_mastery(client: RiotClient, puuids: Sequence[str]) -> pd.DataFrame:
+    """Champion masteries for the players in a live game -- one call each.
+
+    Unlike a stored match, this is unambiguously pre-game: the game has not
+    finished, so nothing here can contain its result.
+    """
+    rows = []
+    for puuid in puuids:
+        try:
+            entries = client.get_champion_masteries(puuid)
+        except RiotNotFoundError:
+            continue
+        for entry in entries:
+            if entry.get("championId") is None:
+                continue
+            rows.append(
+                {
+                    "puuid": puuid,
+                    "champion_id": int(entry["championId"]),
+                    "mastery_points": entry.get("championPoints") or 0,
+                }
+            )
+    return pd.DataFrame(rows, columns=["puuid", "champion_id", "mastery_points"])
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +231,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--blue", nargs=5, metavar="PUUID", help="five blue-side PUUIDs")
     parser.add_argument("--red", nargs=5, metavar="PUUID", help="five red-side PUUIDs")
     parser.add_argument("--db", default="data/cache/riot.sqlite")
+    parser.add_argument(
+        "--skip-mastery", action="store_true",
+        help="skip the 10 champion-mastery lookups (faster, weaker prediction)",
+    )
     parser.add_argument("--log-level", default="WARNING")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -237,6 +274,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                       "out of distribution.")
             teams = teams_from_active_game(game)
             blue, red = teams.blue, teams.red
+            champions = teams.champions
             if teams.hidden:
                 print(
                     f"  [!] Riot withheld the identity of {teams.hidden} of 10 players "
@@ -248,17 +286,26 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return 1
         else:
             blue, red = list(args.blue), list(args.red)
+            champions = {}
             if len(blue) != 5 or len(red) != 5:
                 print(f"error: expected 5 players per side, got {len(blue)} and {len(red)}")
                 return 1
 
-        players = gather_players(client, blue, red)
+        players = gather_players(client, blue, red, champions)
         unranked = int(players["tier"].isna().sum())
         if unranked:
             print(f"  [!] {unranked} of 10 players have no ranked entry; "
                   "their values are imputed and the prediction is weaker for it.")
 
-        features = features_for_players(players, require_full_teams=False)
+        mastery_table = None
+        if not args.skip_mastery and players["champion_id"].notna().any():
+            mastery_table = gather_mastery(client, list(blue) + list(red))
+            if mastery_table.empty:
+                print("  [!] no champion mastery available; those features are imputed.")
+
+        features = features_for_players(
+            players, require_full_teams=False, mastery_table=mastery_table
+        )
         if features.empty:
             print("error: could not build features for this game")
             return 1
