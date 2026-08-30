@@ -160,29 +160,31 @@ MASTERY_FEATURES = (
     "diff_mastery_rank_mean",
 )
 #
-# Status: promising, not yet established. On the 464 matches with full coverage
-# (22% of the table, 6,000 of 15,595 players fetched), a rolling-origin ablation
-# gave a mean accuracy gain of +0.0215 with 4 of 5 folds improving -- but a
-# standard error of 0.0207, so about one sigma. For contrast, role features
-# improved 1 fold of 6 and champion winrate 2 of 6.
+# Enabled on measurement, at 100% coverage (all 15,595 players fetched). A
+# rolling-origin ablation over six folds on 2,113 matches:
 #
-# The covered subset is also not a fair sample: base accuracy on it is ~0.70
-# against ~0.63 overall, because a match only qualifies when all ten players are
-# among the most recently active.
+#   log loss  +0.0064 (se 0.0024), 5 of 6 folds improved  -- about 2.7 sigma
+#   AUC       +0.0114 (se 0.0076), 4 of 6                 -- about 1.5 sigma
+#   accuracy  +0.0079 (se 0.0070), 3 of 6                 -- about 1.1 sigma
 #
-# DISABLED until coverage is uniform across time. Collection visits players
-# newest-match-first, which is right for spending a partial budget but produces
-# a savage train/test shift while it is incomplete: at 6,000 of 15,595 players
-# the chronological split had 0.2% mastery coverage in training, 9.5% in
-# validation and 100% in test. The model fitted a coefficient against an imputed
-# constant, then met real values in test and scored a log loss of 7.44 against a
-# coin flip's 0.69.
+# So it earns its place on probability quality rather than on accuracy, which is
+# the more useful of the two for a near-coin-flip predictor: it barely changes
+# which side is called, and reliably improves how well the stated probability
+# matches reality. diff_mastery_log_mean correlates with the outcome at 0.124,
+# against 0.158 for the rank gap and 0.004 for champion identity.
 #
-# The lesson generalises: a feature that is missing-at-random is a nuisance, but
-# one whose missingness correlates with time breaks a time-ordered split
-# outright. Re-enable once every split has comparable coverage, then re-run the
-# ablation.
-INCLUDE_MASTERY_FEATURES = False
+# Coverage has to stay uniform across time, and that is not a detail. Collection
+# visits players newest-match-first, which is the right way to spend a partial
+# budget but makes missingness a function of time. At 6,000 of 15,595 players
+# the chronological split had 0.2% coverage in training, 9.5% in validation and
+# 100% in test; the model fitted a coefficient against an imputed constant, met
+# real values in test, and scored a log loss of 7.44 against a coin flip's 0.69.
+#
+# A feature missing at random is a nuisance. A feature whose missingness
+# correlates with time breaks a time-ordered split outright, while still looking
+# like a working column. If coverage is ever partial again, disable this rather
+# than letting the imputer paper over it.
+INCLUDE_MASTERY_FEATURES = True
 
 # Beta prior strength for champion winrates. A champion seen five times should
 # not be credited with an 80% winrate, so estimates shrink toward 0.5 until the

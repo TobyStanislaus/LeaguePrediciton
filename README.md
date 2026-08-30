@@ -292,8 +292,12 @@ nothing on every run. `tests/test_collect.py` pins this.
 
 | Model | Accuracy | Log loss | Brier | ROC AUC |
 | --- | --- | --- | --- | --- |
-| **logistic** | **0.663** | **0.632** | **0.221** | **0.713** |
+| **logistic** | **0.668** | **0.624** | **0.217** | **0.718** |
 | boosted | 0.611 | 0.675 | 0.239 | 0.642 |
+
+Features: team rank/LP/winrate/streak aggregates (27 columns) plus champion
+mastery (6). Role-aware and champion-winrate features were built, measured and
+disabled — see below.
 
 Always-predict-blue scores 0.528; a constant 0.5 prediction scores 0.693 on log
 loss. Both models beat both bars, and the linear model wins — on a weak,
@@ -346,6 +350,50 @@ Two caveats on these numbers:
 * **Regularisation matters more than model choice.** An unregularised logistic
   fit scored 0.532 with log loss 0.711 — worse than a coin flip — on exactly
   the same features. Hence the cross-validated `C`.
+
+---
+
+## Feature experiments, measured
+
+Every candidate feature set was ablated over six rolling-origin folds rather
+than judged on one split. Three were tried; one survived.
+
+| Feature set | Accuracy | Log loss | Folds improved | Shipped |
+| --- | --- | --- | --- | --- |
+| Role-aware lane gaps (6 cols) | −0.011 | flat | 1 / 6 | no |
+| Champion winrate (3 cols) | −0.002 | flat | 2 / 6 | no |
+| **Champion mastery (6 cols)** | **+0.008** | **+0.006** | **5 / 6 (log loss)** | **yes** |
+
+**Role features** looked like a +0.022 win on a single split. Six folds said
+−0.011. That was split luck, and it is why nothing here is judged on one split.
+
+**Champion winrate** failed structurally: Riot balances champions toward even
+winrates, and averaging five per side cancels most of the remaining spread. The
+resulting difference has σ = 0.019 and correlates with the outcome at 0.004.
+Champion *identity* is not the signal.
+
+**Champion mastery** — proficiency on the champion actually locked — is. It
+correlates with the outcome at 0.124, against 0.158 for the rank gap. It earns
+its place on log loss (2.7σ, 5 of 6 folds) rather than accuracy (1.1σ), which is
+the more useful of the two here: it barely changes which side is called, and
+reliably improves how honest the stated probability is.
+
+### The failure worth reading about
+
+Enabling mastery at partial coverage sent held-out log loss from 0.632 to
+**7.44** — ten times worse than always predicting 0.5.
+
+The feature was fine; its *missingness* was not. Collection visits players
+newest-match-first, which is the right way to spend a partial budget, but it
+makes coverage a function of time. At 6,000 of 15,595 players the chronological
+split had **0.2%** coverage in training, 9.5% in validation and **100%** in
+test. The model fitted a coefficient against an imputed constant, then met real
+values in the test period.
+
+A feature missing at random is a nuisance. A feature whose missingness
+correlates with time breaks a time-ordered split outright — while still looking
+like a perfectly healthy column. Coverage is now 100% in every split; if that
+ever regresses, disable the feature rather than letting the imputer hide it.
 
 ---
 
