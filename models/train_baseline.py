@@ -77,7 +77,8 @@ def show_coefficients(model: Pipeline, top: int = 10) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", default="data/processed/features.parquet")
-    parser.add_argument("--test-fraction", type=float, default=0.25)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument(
         "--C", type=float, default=None,
         help="pin inverse regularisation strength; default is time-series cross-validated",
@@ -100,7 +101,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     model = build_model(C=args.C)
     metrics, _, _ = run_experiment(
-        "logistic regression", model, table, args.test_fraction, plot
+        "logistic regression", model, table, args.val_fraction, args.test_fraction, plot
     )
     show_coefficients(model)
 

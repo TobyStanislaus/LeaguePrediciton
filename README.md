@@ -250,11 +250,13 @@ python -m models.train_boosted --features data/processed/features.parquet
 
 Both are scored identically, so the comparison is fair:
 
-* **Time-based split** — earliest matches train, latest test. A random shuffle
-  would let the model see the future; rank and LP distributions drift across a
-  season, so a shuffle overstates accuracy. A guard asserts the actual kickoff
-  times on each side of the split, and fails if training data reaches into the
-  test period.
+* **Chronological 60 / 20 / 20 split** — oldest matches train, middle validate,
+  newest test. A random shuffle would let the model see the future; rank and LP
+  distributions drift across a season, so a shuffle overstates accuracy.
+  Validation exists so hyperparameters and stopping points are chosen without
+  ever consulting test — reusing test for selection is a slow leak that drifts
+  the reported number upward every time you look at it. A guard asserts the
+  actual kickoff times of all three, and fails if any reaches forward.
 * **Metrics** — accuracy, log loss, Brier score, ROC AUC, plus the
   always-predict-blue baseline that any useful model has to beat.
 * **Calibration** — a quantile-binned reliability table and a plot in
@@ -285,22 +287,29 @@ nothing on every run. `tests/test_collect.py` pins this.
 
 ## Results so far
 
-342 matches from the EUW apex ladders (Master/GM/Challenger) that survive the
-staleness guard, 256 train / 86 test on a chronological split.
+2,113 matches from the EUW apex ladders (Master/GM/Challenger), 1,269 train /
+422 validation / 422 test, chronological.
 
-| Mode | Model | Accuracy | Log loss | Brier | ROC AUC |
-| --- | --- | --- | --- | --- | --- |
-| **reconstructed** | **logistic** | **0.593** | **0.644** | **0.227** | **0.726** |
-| reconstructed | boosted | 0.570 | 0.728 ⚠️ | 0.261 | 0.648 |
+| Model | Accuracy | Log loss | Brier | ROC AUC |
+| --- | --- | --- | --- | --- |
+| **logistic** | **0.663** | **0.632** | **0.221** | **0.713** |
+| boosted | 0.611 | 0.675 | 0.239 | 0.642 |
 
-Always-predict-blue scores 0.547; a constant 0.5 prediction scores 0.693 on log
-loss. The logistic model beats both bars. The boosted model does not — its log
-loss is worse than a constant prediction, which the sanity check flags
-automatically. On a few hundred matches with a weak signal, the linear model is
-the better tool, and that ordering is itself informative.
+Always-predict-blue scores 0.528; a constant 0.5 prediction scores 0.693 on log
+loss. Both models beat both bars, and the linear model wins — on a weak,
+near-linear signal that ordering is itself informative.
 
-At 86 test matches every figure here is noisy, which the evaluator also says out
-loud.
+### More data will not help from here
+
+The learning curve plateaus from roughly 400 training matches. Over the second
+half of the curve validation accuracy moved **+0.000**, against a noise floor of
+±0.024 on 422 validation matches. Training and validation accuracy have
+converged to within 0.003 of each other.
+
+That combination — flat curve, no train/validation gap — means the model is
+limited by what these 27 features can express, not by row count or by
+overfitting. Going from 342 to 2,113 matches was worth real accuracy; going to
+10,000 would not be. **Better features beat more rows now.**
 
 ### The cost of leakage, with error bars
 
@@ -309,11 +318,12 @@ on an identical split, bootstrapping the gap over resampled test matches:
 
 | Model | naive | reconstructed | Accuracy gap | 95% CI | AUC gap | 95% CI |
 | --- | --- | --- | --- | --- | --- | --- |
-| logistic | 0.686 | 0.593 | **+0.093** | [+0.035, +0.163] | +0.067 | [+0.029, +0.108] |
-| boosted | 0.663 | 0.581 | +0.081 | [+0.000, +0.163] | +0.088 | [+0.035, +0.144] |
+| logistic | 0.718 | 0.665 | **+0.053** | [+0.028, +0.079] | +0.052 | [+0.038, +0.068] |
+| boosted | 0.692 | 0.620 | +0.072 | [+0.036, +0.108] | +0.061 | [+0.035, +0.086] |
 
-**Joining a current snapshot onto past matches buys about nine points of
-accuracy that the model has not earned**, and the interval clears zero.
+On 529 test matches, **joining a current snapshot onto past matches buys five to
+seven points of accuracy the model has not earned**, and every interval clears
+zero.
 
 The instructive part is that the leaky number is *not* absurd. Naive joining
 gives 68.6% — high, but the kind of number you might talk yourself into. Leakage
@@ -381,6 +391,32 @@ a side with two of five known is a much weaker prediction than five of five.
 single prediction is a lean, not a call. The probability is the useful output —
 "61.6% blue" is a meaningful claim about a near-coin-flip game in a way that a
 bare winner label is not.
+
+---
+
+## Monitoring performance
+
+```bash
+python -m models.diagnostics --features data/processed/features.parquet
+```
+
+Writes `artifacts/diagnostics.png` — four panels, and one question each:
+
+| Panel | Question it answers |
+| --- | --- |
+| Accuracy vs training size | Is the dataset the bottleneck, or the signal? |
+| Log loss vs training size | Same sweep, scored on calibration rather than decisions |
+| Log loss as boosting proceeds | Where does the model start memorising? |
+| Calibration on held-out test | Do stated probabilities match observed frequencies? |
+
+The learning curve is the one to watch. Training prefixes are taken in
+chronological order, never sampled — the model is always trained on the past and
+scored on the future, at every size, or the curve measures something the
+deployed model never does. The CLI prints a slope over the last three points and
+says plainly whether more collection should pay off.
+
+Accuracy and log loss get separate panels rather than sharing one frame with two
+y-axes; a dual-axis chart invites reading a crossing point that means nothing.
 
 ---
 

@@ -76,7 +76,8 @@ def show_importances(model: Any, top: int = 10) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", default="data/processed/features.parquet")
-    parser.add_argument("--test-fraction", type=float, default=0.25)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--max-depth", type=int, default=4)
@@ -97,7 +98,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     plot = Path(args.artifacts) / "calibration_boosted.png"
 
     model = build_model(args.n_estimators, args.learning_rate, args.max_depth)
-    metrics, _, _ = run_experiment("gradient boosting", model, table, args.test_fraction, plot)
+    metrics, _, _ = run_experiment("gradient boosting", model, table, args.val_fraction, args.test_fraction, plot)
     show_importances(model)
 
     if args.save:

@@ -97,6 +97,75 @@ def time_split(table: pd.DataFrame, test_fraction: float = 0.25) -> Split:
     )
 
 
+@dataclass
+class ThreeWaySplit:
+    """Chronological train / validation / test.
+
+    Validation exists so hyperparameters and stopping points are chosen without
+    ever consulting the test set. Reusing test for selection is a slow leak: the
+    reported number drifts upward every time you glance at it.
+    """
+
+    X_train: pd.DataFrame
+    y_train: pd.Series
+    X_val: pd.DataFrame
+    y_val: pd.Series
+    X_test: pd.DataFrame
+    y_test: pd.Series
+    train_ts: pd.Series
+    val_ts: pd.Series
+    test_ts: pd.Series
+
+    @property
+    def sizes(self) -> tuple[int, int, int]:
+        return len(self.X_train), len(self.X_val), len(self.X_test)
+
+
+def time_split_3way(
+    table: pd.DataFrame, val_fraction: float = 0.2, test_fraction: float = 0.2
+) -> ThreeWaySplit:
+    """Split chronologically into 60/20/20 by default: oldest trains, newest tests."""
+    # Each fraction on its own, not just the sum: (-0.1, 0.2) sums to a legal
+    # 0.1 while asking for a negative validation set.
+    if val_fraction <= 0.0 or test_fraction <= 0.0:
+        raise ValueError("val_fraction and test_fraction must each be positive")
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError("val_fraction + test_fraction must leave room for training")
+    if len(table) < 3:
+        raise ValueError("need at least three matches to make three splits")
+
+    ordered = table.sort_values("game_start_ts").reset_index(drop=True)
+    n = len(ordered)
+    n_test = max(1, int(n * test_fraction))
+    n_val = max(1, int(n * val_fraction))
+    n_train = n - n_val - n_test
+    if n_train < 1:
+        raise ValueError("not enough matches to leave anything for training")
+
+    columns = feature_columns()
+    train = ordered.iloc[:n_train]
+    val = ordered.iloc[n_train : n_train + n_val]
+    test = ordered.iloc[n_train + n_val :]
+
+    return ThreeWaySplit(
+        X_train=train[columns], y_train=train[LABEL_COLUMN],
+        X_val=val[columns], y_val=val[LABEL_COLUMN],
+        X_test=test[columns], y_test=test[LABEL_COLUMN],
+        train_ts=train["game_start_ts"], val_ts=val["game_start_ts"],
+        test_ts=test["game_start_ts"],
+    )
+
+
+def assert_3way_is_chronological(split: ThreeWaySplit) -> None:
+    """train < validation < test, by actual kickoff time."""
+    if min(split.sizes) == 0:
+        raise AssertionError("one of the three splits is empty")
+    if float(split.train_ts.max()) > float(split.val_ts.min()):
+        raise AssertionError("training data reaches into the validation period")
+    if float(split.val_ts.max()) > float(split.test_ts.min()):
+        raise AssertionError("validation data reaches into the test period")
+
+
 def assert_split_is_chronological(split: Split) -> None:
     """Guard against a shuffle sneaking back in.
 
@@ -380,39 +449,57 @@ def run_experiment(
     name: str,
     model: Any,
     table: pd.DataFrame,
-    test_fraction: float = 0.25,
+    val_fraction: float = 0.2,
+    test_fraction: float = 0.2,
     plot_path: Path | None = None,
 ) -> tuple[Metrics, pd.DataFrame, np.ndarray]:
-    """Fit on the earlier matches, score the later ones, report, and plot."""
-    split = time_split(table, test_fraction=test_fraction)
-    assert_split_is_chronological(split)
+    """Fit on the oldest matches, check on validation, report on the newest.
+
+    Validation is scored and printed but never used to pick anything here --
+    that is what makes the test figure an honest estimate. Tuning that *does*
+    consult validation (boosting rounds, feature choices) belongs in
+    ``models.diagnostics``, which never touches test.
+    """
+    split = time_split_3way(table, val_fraction=val_fraction, test_fraction=test_fraction)
+    assert_3way_is_chronological(split)
 
     mode = table["leakage_mode"].iloc[0] if "leakage_mode" in table.columns else "unknown"
     log.info(
-        "%s | mode=%s | train %d (to %s) | test %d (from %s)",
-        name,
-        mode,
-        split.sizes[0],
-        pd.to_datetime(split.cutoff_ts, unit="s"),
-        split.sizes[1],
-        pd.to_datetime(split.cutoff_ts, unit="s"),
+        "%s | mode=%s | train %d / validation %d / test %d",
+        name, mode, *split.sizes,
     )
 
     model.fit(split.X_train, split.y_train)
-    y_prob = model.predict_proba(split.X_test)[:, 1]
 
-    metrics = evaluate_predictions(f"{name} [{mode}]", split.y_test, y_prob, split.sizes[0])
-    calibration = calibration_table(split.y_test, y_prob)
+    val_prob = model.predict_proba(split.X_val)[:, 1]
+    val_metrics = evaluate_predictions(
+        f"{name} [{mode}] -- validation", split.y_val, val_prob, split.sizes[0]
+    )
+    report(val_metrics)
+
+    test_prob = model.predict_proba(split.X_test)[:, 1]
+    metrics = evaluate_predictions(
+        f"{name} [{mode}] -- held-out test", split.y_test, test_prob, split.sizes[0]
+    )
+    calibration = calibration_table(split.y_test, test_prob)
     report(metrics, calibration)
+
+    gap = val_metrics.accuracy - metrics.accuracy
+    if abs(gap) > 0.10:
+        print(
+            f"\n  [!] validation and test accuracy differ by {gap:+.3f}. With splits this "
+            "size that is usually noise, but a persistent gap means the two periods "
+            "differ (a patch, a rank reset) more than the model handles."
+        )
 
     if plot_path is not None:
         written = plot_calibration(
-            {name: (split.y_test, y_prob)}, plot_path, title=f"{name} ({mode})"
+            {name: (split.y_test, test_prob)}, plot_path, title=f"{name} ({mode})"
         )
         if written:
             print(f"\n  calibration plot -> {written}")
 
-    return metrics, calibration, y_prob
+    return metrics, calibration, test_prob
 
 
 # --------------------------------------------------------------------------

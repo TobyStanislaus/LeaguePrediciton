@@ -351,6 +351,12 @@ def build_parser() -> argparse.ArgumentParser:
              "(point-in-time correct, but returns little until you re-run later)",
     )
     parser.add_argument(
+        "--since-days", type=float, default=None,
+        help="only request matches from the last N days. Feature building drops pairs whose"
+        " snapshot is more than --max-snapshot-age-days after kickoff, so fetching older"
+        " matches burns rate limit on rows that will be discarded.",
+    )
+    parser.add_argument(
         "--skip-participants", action="store_true", help="skip phase 3"
     )
     parser.add_argument(
@@ -409,6 +415,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (time.time() - start_time) / 3600.0,
             )
         else:
+            if args.since_days is not None:
+                start_time = int(time.time() - args.since_days * 86400)
+                log.info(
+                    "requesting only matches from the last %.1f days (after %s)",
+                    args.since_days,
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(start_time)),
+                )
             log.warning(
                 "collecting matches played BEFORE the ladder snapshot. Their recorded LP and "
                 "win/loss counts already include those results -- feature building must do a "
