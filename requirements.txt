@@ -11,6 +11,7 @@ scikit-learn>=1.5
 xgboost>=2.1
 lightgbm>=4.5
 matplotlib>=3.9        # calibration curves
+joblib>=1.4            # model persistence (also a scikit-learn dependency)
 
 # --- dev ---
 pytest>=8.0

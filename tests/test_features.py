@@ -140,6 +140,23 @@ def test_label_is_not_among_the_features():
     assert not any(column in METADATA_COLUMNS for column in feature_columns())
 
 
+def test_every_builder_emits_columns_in_the_declared_order():
+    """Regression: a model fed these out of order predicts confident nonsense.
+
+    build_feature_table reordered at the end, so a mismatch inside the pivot
+    stayed invisible until the prediction path used the pivot directly.
+    """
+    import pandas as pd_
+
+    from features.build_features import pivot_team_features
+
+    teams = pd_.DataFrame(
+        [{"match_id": "m", "team_id": team, **{stat: 1.0 for stat in TEAM_STATS}}
+         for team in (100, 200)]
+    )
+    assert list(pivot_team_features(teams).columns) == feature_columns()
+
+
 def test_feature_columns_are_unique_and_stable():
     columns = feature_columns()
     assert len(columns) == len(set(columns))

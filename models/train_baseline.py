@@ -1,4 +1,4 @@
-"""Logistic regression baseline on the pre-game team feature table.
+﻿"""Logistic regression baseline on the pre-game team feature table.
 
 Deliberately simple and the first thing to run: a linear model on rank/LP/
 winrate differences is close to the honest ceiling for this problem, and it is
@@ -23,7 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from features.build_features import feature_columns
-from models.evaluate import DEFAULT_ARTIFACT_DIR, load_features, run_experiment
+from models.evaluate import DEFAULT_ARTIFACT_DIR, load_features, run_experiment, save_model
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +83,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="pin inverse regularisation strength; default is time-series cross-validated",
     )
     parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACT_DIR))
+    parser.add_argument(
+        "--save", default="artifacts/model_baseline.joblib",
+        help="where to persist the fitted model; pass an empty string to skip",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -99,6 +103,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         "logistic regression", model, table, args.test_fraction, plot
     )
     show_coefficients(model)
+
+    if args.save:
+        saved = save_model(
+            model,
+            args.save,
+            {
+                "name": "logistic regression",
+                "mode": str(table["leakage_mode"].iloc[0]),
+                "n_train": metrics.n_train,
+                "metrics": metrics.as_dict(),
+            },
+        )
+        print(f"\n  model saved -> {saved}")
 
     return 1 if metrics.accuracy >= 0.80 else 0
 

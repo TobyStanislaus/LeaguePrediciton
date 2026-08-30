@@ -59,9 +59,23 @@ def _line_problem(line: str) -> str | None:
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
-    ).stdout
+    """Run git and return stdout as UTF-8.
+
+    The encoding is explicit because Python otherwise decodes with the locale
+    codec -- cp1252 on Windows -- and any non-Latin-1 character anywhere in the
+    diff (an emoji in a README is enough) raises UnicodeDecodeError inside a
+    reader thread, leaving stdout as None. A scanner that dies on the content
+    it is meant to inspect is worse than no scanner, so decode defensively and
+    never let this return None.
+    """
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        check=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.stdout or ""
 
 
 def _staged_paths() -> list[str]:

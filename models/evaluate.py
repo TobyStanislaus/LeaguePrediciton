@@ -332,6 +332,50 @@ def load_features(path: str | Path) -> pd.DataFrame:
     return table
 
 
+def save_model(model: Any, path: str | Path, metadata: dict[str, Any]) -> Path:
+    """Persist a fitted pipeline together with what it was trained on.
+
+    The feature column order is stored alongside it: a model silently fed
+    columns in a different order would produce confident nonsense.
+    """
+    import joblib
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": model,
+            "feature_columns": feature_columns(),
+            "saved_at": pd.Timestamp.now("UTC").isoformat(),
+            **metadata,
+        },
+        path,
+    )
+    return path
+
+
+def load_model(path: str | Path) -> tuple[Any, dict[str, Any]]:
+    """Load a saved model, checking its feature contract still matches."""
+    import joblib
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no model at {path}. Train and save one first:\n"
+            "    python -m models.train_baseline --save artifacts/model.joblib"
+        )
+
+    bundle = joblib.load(path)
+    stored = bundle.get("feature_columns")
+    if stored != feature_columns():
+        raise ValueError(
+            "this model was trained on different feature columns than the code now "
+            f"produces ({len(stored or [])} vs {len(feature_columns())}). Retrain it."
+        )
+    model = bundle.pop("model")
+    return model, bundle
+
+
 def run_experiment(
     name: str,
     model: Any,
@@ -369,3 +413,53 @@ def run_experiment(
             print(f"\n  calibration plot -> {written}")
 
     return metrics, calibration, y_prob
+
+
+# --------------------------------------------------------------------------
+# CLI -- score a saved model
+# --------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Score an already-trained model on the held-out tail of a feature table."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate a saved model on the held-out (latest) matches."
+    )
+    parser.add_argument("--model", default="artifacts/model.joblib")
+    parser.add_argument("--features", default="data/processed/features.parquet")
+    parser.add_argument("--test-fraction", type=float, default=0.25)
+    parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACT_DIR))
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(name)s | %(message)s")
+
+    model, meta = load_model(args.model)
+    table = load_features(args.features)
+
+    split = time_split(table, test_fraction=args.test_fraction)
+    assert_split_is_chronological(split)
+
+    y_prob = model.predict_proba(split.X_test)[:, 1]
+    metrics = evaluate_predictions(
+        f"{meta.get('name', 'saved model')}", split.y_test, y_prob, split.sizes[0]
+    )
+    report(metrics, calibration_table(split.y_test, y_prob))
+
+    print(f"\n  model trained {meta.get('saved_at', 'unknown')} on mode="
+          f"{meta.get('mode', 'unknown')} ({meta.get('n_train', '?')} matches)")
+
+    written = plot_calibration(
+        {meta.get("name", "model"): (split.y_test, y_prob)},
+        Path(args.artifacts) / "calibration_saved_model.png",
+        title="Saved model calibration",
+    )
+    if written:
+        print(f"  calibration plot -> {written}")
+
+    return 1 if metrics.accuracy >= ALARMING_ACCURACY else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

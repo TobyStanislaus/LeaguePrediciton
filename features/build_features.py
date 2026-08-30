@@ -293,14 +293,26 @@ def build_player_state(
             state, pairs[["puuid", "game_start_ts", "player_won"]], lp_delta
         )
 
-    state["rank_points"] = [
+    return derive_player_metrics(state)
+
+
+def derive_player_metrics(players: pd.DataFrame) -> pd.DataFrame:
+    """Add ``rank_points``, ``games`` and ``winrate`` to raw player rows.
+
+    Split out from ``build_player_state`` so prediction can reuse it for
+    players who are not part of any stored match.
+    """
+    players = players.copy()
+    players["rank_points"] = [
         rank_points(t, d, lp)
-        for t, d, lp in zip(state["tier"], state["rank_division"], state["league_points"])
+        for t, d, lp in zip(players["tier"], players["rank_division"], players["league_points"])
     ]
-    games = state["wins"] + state["losses"]
-    state["games"] = games
-    state["winrate"] = np.where(games > 0, state["wins"] / games.replace(0, np.nan), np.nan)
-    return state
+    games = players["wins"] + players["losses"]
+    players["games"] = games
+    players["winrate"] = np.where(
+        games > 0, players["wins"] / games.replace(0, np.nan), np.nan
+    )
+    return players
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +344,58 @@ def aggregate_teams(state: pd.DataFrame, require_full_teams: bool = True) -> pd.
     return teams
 
 
+def pivot_team_features(teams: pd.DataFrame) -> pd.DataFrame:
+    """Turn per-(match, team) aggregates into one row per match.
+
+    Produces ``blue_*``, ``red_*`` and ``diff_*`` columns. Matches missing
+    either side are dropped.
+    """
+    blue = teams[teams["team_id"] == BLUE].set_index("match_id")
+    red = teams[teams["team_id"] == RED].set_index("match_id")
+    both = blue.index.intersection(red.index)
+    if len(both) == 0:
+        return pd.DataFrame(columns=feature_columns())
+
+    blue, red = blue.loc[both], red.loc[both]
+    table = pd.DataFrame(index=both)
+    for stat in TEAM_STATS:
+        table[f"blue_{stat}"] = blue[stat]
+        table[f"red_{stat}"] = red[stat]
+        table[f"diff_{stat}"] = blue[stat] - red[stat]
+
+    # Return in the declared order, not construction order. A model fed these
+    # columns in a different order than it was fitted on produces confident
+    # nonsense, and only sklearn's feature-name check stands between the two.
+    return table[feature_columns()]
+
+
+def features_for_players(
+    players: pd.DataFrame, match_id: str = "live", require_full_teams: bool = True
+) -> pd.DataFrame:
+    """Build one feature row from ten players' current ranked state.
+
+    This is the prediction path: no stored match, no label, no reconstruction
+    -- the ranks *are* pre-game because the game has not been played yet.
+
+    ``players`` needs ``puuid``, ``team_id`` (100/200), ``tier``,
+    ``rank_division``, ``league_points``, ``wins``, ``losses``, ``hot_streak``.
+    """
+    required = {
+        "puuid", "team_id", "tier", "rank_division", "league_points",
+        "wins", "losses", "hot_streak",
+    }
+    missing = required - set(players.columns)
+    if missing:
+        raise ValueError(f"players is missing columns: {sorted(missing)}")
+
+    players = players.copy()
+    players["match_id"] = match_id
+    teams = aggregate_teams(
+        derive_player_metrics(players), require_full_teams=require_full_teams
+    )
+    return pivot_team_features(teams)
+
+
 def build_feature_table(
     cache: Cache,
     mode: Mode = "reconstructed",
@@ -354,21 +418,12 @@ def build_feature_table(
     if teams.empty:
         return empty
 
-    blue = teams[teams["team_id"] == BLUE].set_index("match_id")
-    red = teams[teams["team_id"] == RED].set_index("match_id")
-    both = blue.index.intersection(red.index)
-    if len(both) == 0:
+    table = pivot_team_features(teams)
+    if table.empty:
         log.warning("no match has both teams fully resolved")
         return empty
 
-    blue, red = blue.loc[both], red.loc[both]
-
-    table = pd.DataFrame(index=both)
-    for stat in TEAM_STATS:
-        table[f"blue_{stat}"] = blue[stat]
-        table[f"red_{stat}"] = red[stat]
-        table[f"diff_{stat}"] = blue[stat] - red[stat]
-
+    both = table.index
     meta = frames.matches.set_index("match_id").loc[both]
     table["game_start_ts"] = meta["game_start_ts"]
     table["queue_id"] = meta["queue_id"]

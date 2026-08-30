@@ -116,6 +116,29 @@ def test_scanner_flags_the_right_lines():
         assert flagged is should_flag, f"wrong verdict for: {text}"
 
 
+def test_git_output_decodes_as_utf8_not_the_locale_codec():
+    """Regression: the scanner once died on its own repository's content.
+
+    subprocess with text=True decodes using the locale codec (cp1252 on
+    Windows). A single emoji in the README made git's output undecodable, the
+    reader thread raised, stdout came back as None, and the scanner crashed
+    before inspecting anything -- while the surrounding command carried on.
+    """
+    scanner = _load_scanner()
+    out = scanner._git("log", "-1", "--format=%s")
+    assert isinstance(out, str)
+
+    # The README genuinely contains non-Latin-1 characters; scanning the whole
+    # working tree must survive them rather than throwing.
+    assert isinstance(scanner.scan_committable(), list)
+    assert isinstance(scanner.scan_staged(), list)
+
+
+def test_git_helper_never_returns_none():
+    scanner = _load_scanner()
+    assert scanner._git("status", "--porcelain") is not None
+
+
 def test_allowlist_pragma_suppresses_a_line():
     scanner = _load_scanner()
     fake_key = "RGAPI-" + "0123abcd-4567-89ef-0123-456789abcdef"

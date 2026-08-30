@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -65,6 +65,9 @@ APEX_TIERS = {"CHALLENGER", "GRANDMASTER", "MASTER"}
 TTL_IMMUTABLE = None
 TTL_LADDER = 6 * 3600
 TTL_MATCH_IDS = 3600
+# An in-progress game changes by the second, and a player may finish one and
+# start another; cache it only long enough to avoid hammering a retry loop.
+TTL_ACTIVE_GAME = 60
 
 
 # --------------------------------------------------------------------------
@@ -415,6 +418,37 @@ class RiotClient:
             f"/lol/summoner/v4/summoners/{summoner_id}",
             endpoint="summoner-v4.by-id",
             max_age=TTL_LADDER,
+        )
+
+    # -- ACCOUNT-V1 --------------------------------------------------------
+
+    def get_account_by_riot_id(self, game_name: str, tag_line: str) -> dict[str, Any]:
+        """Resolve a Riot ID ("Name#TAG") to an account record containing the PUUID.
+
+        Lives on the *regional* host, not the platform one. The tag is passed
+        without its leading '#'.
+        """
+        return self._get(
+            f"{self.region}.api.riotgames.com",
+            f"/riot/account/v1/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}",
+            endpoint="account-v1.by-riot-id",
+            max_age=TTL_LADDER,
+        )
+
+    # -- SPECTATOR-V5 ------------------------------------------------------
+
+    def get_active_game(self, puuid: str) -> dict[str, Any]:
+        """The game this player is currently in.
+
+        Raises :class:`RiotNotFoundError` when they are not in one -- Riot
+        signals "not in game" with a 404, so that is an ordinary answer here
+        rather than an error worth retrying.
+        """
+        return self._get(
+            f"{self.platform}.api.riotgames.com",
+            f"/lol/spectator/v5/active-games/by-summoner/{puuid}",
+            endpoint="spectator-v5.active-game",
+            max_age=TTL_ACTIVE_GAME,
         )
 
     # -- MATCH-V5 ----------------------------------------------------------

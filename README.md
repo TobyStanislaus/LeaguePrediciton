@@ -339,6 +339,68 @@ Two caveats on these numbers:
 
 ---
 
+## Predicting a game
+
+Training saves the fitted pipeline to `artifacts/` automatically. To predict the
+game someone is in right now:
+
+```bash
+python -m models.predict --riot-id "YourName#TAG" --platform euw1
+```
+
+Real output:
+
+```
+live game 7967085565 on EUW1 (queue 420, 10m in)
+  [!] Riot withheld the identity of 3 of 10 players (blue 0, red 3).
+
+  blue: 5/5 ranked | ladder points 5160 | winrate 57.3% | Challenger, Grandmaster, Master
+  red:  2/5 ranked | ladder points 4788 | winrate 56.5% | Grandmaster, Master
+
+  prediction: BLUE 61.6%   (blue 61.6% / red 38.4%)
+```
+
+Or score any ten players directly, blue side first:
+
+```bash
+python -m models.predict --blue p1 p2 p3 p4 p5 --red p6 p7 p8 p9 p10
+```
+
+This is the one place needing no leakage precautions: the game has not been
+played, so a player's current rank *is* their pre-game rank. That is exactly
+what restricting the feature set to pre-game state buys.
+
+### Two real limitations
+
+**Riot hides some players.** SPECTATOR-V5 returns `puuid: null` for some
+participants, with a `riotId` that is only the champion name. Their rank cannot
+be looked up at all. The tool counts them and says so rather than pretending;
+a side with two of five known is a much weaker prediction than five of five.
+
+**The model is not confident, and should not sound it.** At ~59% accuracy a
+single prediction is a lean, not a call. The probability is the useful output —
+"61.6% blue" is a meaningful claim about a near-coin-flip game in a way that a
+bare winner label is not.
+
+---
+
+## Testing accuracy
+
+Both training scripts print accuracy, log loss, Brier, AUC and a calibration
+table on the held-out latest matches. To re-score a model you saved earlier,
+without retraining:
+
+```bash
+python -m models.evaluate --model artifacts/model_baseline.joblib --features data/processed/features.parquet
+```
+
+Saved models carry their feature-column contract, training mode, training size
+and original metrics. Loading one whose columns no longer match what the code
+produces is refused rather than silently mispredicted — column *order* alone is
+enough to turn a model into a confident random number generator.
+
+---
+
 ## Tests
 
 ```bash
@@ -355,6 +417,8 @@ pytest
 | `test_collect.py` | three-phase collection, resume, snapshot storage |
 | `test_features.py` | rank encoding, join modes, reconstruction, **leakage** |
 | `test_evaluate.py` | time split, metrics, calibration, sanity thresholds |
+| `test_predict.py` | live-game parsing, hidden players, model persistence |
+| `test_leakage_report.py` | paired bootstrap on the leakage gap |
 
 The central leakage test flips *only* the match outcome between two otherwise
 identical synthetic worlds and asserts the reconstructed features come out

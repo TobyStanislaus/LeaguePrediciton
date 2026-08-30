@@ -1,4 +1,4 @@
-"""Gradient-boosted model (LightGBM, falling back to XGBoost) on the same features.
+﻿"""Gradient-boosted model (LightGBM, falling back to XGBoost) on the same features.
 
 Scored identically to the baseline so the comparison is fair. On rank/LP-only
 features a boosted model usually gains very little over logistic regression --
@@ -18,7 +18,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from features.build_features import feature_columns
-from models.evaluate import DEFAULT_ARTIFACT_DIR, load_features, run_experiment
+from models.evaluate import DEFAULT_ARTIFACT_DIR, load_features, run_experiment, save_model
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +81,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACT_DIR))
+    parser.add_argument(
+        "--save", default="artifacts/model_boosted.joblib",
+        help="where to persist the fitted model; pass an empty string to skip",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -95,6 +99,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     model = build_model(args.n_estimators, args.learning_rate, args.max_depth)
     metrics, _, _ = run_experiment("gradient boosting", model, table, args.test_fraction, plot)
     show_importances(model)
+
+    if args.save:
+        saved = save_model(
+            model,
+            args.save,
+            {
+                "name": "gradient boosting",
+                "mode": str(table["leakage_mode"].iloc[0]),
+                "n_train": metrics.n_train,
+                "metrics": metrics.as_dict(),
+            },
+        )
+        print(f"\n  model saved -> {saved}")
 
     return 1 if metrics.accuracy >= 0.80 else 0
 
